@@ -59,7 +59,10 @@ export async function reconcileSessions(deps: {
         else chain.watcher.watchTx(r0.fundingTx);
       }
       if (r0.closeTx) chain.watcher.watchTx(r0.closeTx);
-      bus.emit("progress", {
+      // An unfunded PLANNED / AWAITING_APPROVAL session has nothing to resume: logging it on every restart was
+      // pure noise. The goal reconciler (goal-funding.ts) reports such goals ONCE with the exact shortfall.
+      const idleUnfunded = (status === "PLANNED" || status === "AWAITING_APPROVAL") && !r0.fundingTx && !(bal && (bal.tusdMicro > 0n || bal.utxoCount > 0));
+      if (!idleUnfunded) bus.emit("progress", {
         goalId: r0.goalId,
         sessionId: id,
         data: { kind: "log", level: "info", text: `reconcile after restart: ${status}${bal ? `, wallet ${bal.tusdMicro} µtUSD / ${bal.lovelace} lovelace` : ""}` },

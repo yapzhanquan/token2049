@@ -8,9 +8,11 @@ const app = createApp(market, fakeReader && tusdUnit ? { fakeChain: { reader: fa
 const port = marketPort(process.env);
 
 market.start();
-const server = serve({ fetch: app.fetch, port }, () => {
+// Loopback by default (MARKET_HOST overrides, e.g. 0.0.0.0 to expose it on purpose).
+const hostname = process.env.MARKET_HOST?.trim() || "127.0.0.1";
+const server = serve({ fetch: app.fetch, port, hostname }, () => {
   console.log(
-    `[market] listening on :${port}${fakeReader ? " (fake-chain test mode — OFFLINE DEMO, payments are NOT on-chain)" : ""}; ` +
+    `[market] listening on ${hostname}:${port}${fakeReader ? " (fake-chain test mode — OFFLINE DEMO, payments are NOT on-chain)" : ""}; ` +
       `${market.catalog().length} agent(s) available`,
   );
 });

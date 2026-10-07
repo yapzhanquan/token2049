@@ -6,7 +6,7 @@ import { useState } from "react";
 import { drepDisplay, microToTusd, type MeDTO, type StakingActionResponse, type StakingStatusDTO } from "@bulkhead/shared";
 import { postSigned, useResource } from "@/lib/client";
 import { useWalletSigner } from "@/lib/wallet-context";
-import { ada, shortAddr } from "@/lib/money";
+import { ada, shortAddr, TICKER } from "@/lib/money";
 import { TxLink } from "./Links";
 import { Modal } from "./Modal";
 
@@ -46,7 +46,7 @@ function TusdTokenRows() {
   const legacy = me?.balances.legacyTusdMicro;
   return (
     <>
-      <dt>tUSD token</dt>
+      <dt>{TICKER} token</dt>
       <dd>
         <span className="mono" title={t.unit}>
           {t.fingerprint}

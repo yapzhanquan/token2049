@@ -4,6 +4,7 @@ import { engineJson, EngineError } from "@/lib/engine";
 import type { TopupStartResponse } from "@bulkhead/shared";
 import { requireEngineUser } from "@/lib/server-user";
 import { publicUrl, stripe, stripeEnabled } from "@/lib/stripe";
+import { TICKER } from "@/lib/money";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -28,7 +29,7 @@ export async function POST(req: Request) {
           price_data: {
             currency: "myr",
             unit_amount: Math.round(amountMYR * 100),
-            product_data: { name: `Bulkhead top-up RM${amountMYR.toFixed(2)} (testnet)`, description: "Converted to tUSD on Cardano preprod" },
+            product_data: { name: `Bulkhead top-up RM${amountMYR.toFixed(2)} (testnet)`, description: `Converted to ${TICKER} on Cardano preprod` },
           },
         },
       ],

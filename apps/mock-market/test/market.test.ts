@@ -6,6 +6,7 @@ import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { closeDb } from "@bulkhead/db";
 import type { AgentCatalogEntry, JobStatusResponse, StartJobResponse } from "@bulkhead/shared";
 import { createApp } from "../src/app";
+import { TUSDM_PREPROD } from "@bulkhead/shared";
 import { buildMarket, FAKE_TUSD_UNIT, normalizeTusdUnit, resolveTusdUnit, type BuiltMarket } from "../src/config";
 import { AGENTS } from "../src/agents";
 import { HttpChainReader, metadataHasReference } from "../src/chain-reader";
@@ -191,7 +192,13 @@ describe("tUSD unit (CIP-68 333)", () => {
     const pol = "ab".repeat(28);
     expect(normalizeTusdUnit(pol + "74555344")).toBe(pol + "0014df1074555344");
     expect(normalizeTusdUnit(pol + "0014df1074555344")).toBe(pol + "0014df1074555344");
-    expect(await resolveTusdUnit({ TUSD_UNIT: pol + "74555344" })).toBe(pol + "0014df1074555344");
+    expect(await resolveTusdUnit({ SETTLEMENT_ASSET: "tusd", TUSD_UNIT: pol + "74555344" })).toBe(pol + "0014df1074555344");
+  });
+  it("matches the engine's settlement unit: tUSDM by default (even with TUSD_UNIT set), tUSD only with SETTLEMENT_ASSET=tusd", async () => {
+    const pol = "ab".repeat(28);
+    expect(await resolveTusdUnit({ TUSD_UNIT: pol + "0014df1074555344" })).toBe(TUSDM_PREPROD.unit);
+    expect(await resolveTusdUnit({ SETTLEMENT_ASSET: "tusd", TUSD_UNIT: pol + "0014df1074555344" })).toBe(pol + "0014df1074555344");
+    expect(await resolveTusdUnit({ SETTLEMENT_UNIT: pol + "01" })).toBe(pol + "01");
   });
 });
 

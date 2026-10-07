@@ -12,8 +12,18 @@ for (const file of [path.resolve(process.cwd(), "../../.env"), path.resolve(proc
   }
 }
 
+// Settlement asset ticker for the UI (mirrors settlementTickerFromEnv in @bulkhead/shared settlement.ts; default tUSDM).
+function settlementTicker(env: NodeJS.ProcessEnv): string {
+  if (env.SETTLEMENT_UNIT?.trim()) {
+    const u = env.SETTLEMENT_UNIT.trim().toLowerCase();
+    return u === "16a55b2a349361ff88c03788f93e1e966e5d689605d044fef722ddde0014df10745553444d" ? "tUSDM" : env.SETTLEMENT_TICKER?.trim() || "units";
+  }
+  return env.SETTLEMENT_ASSET?.trim().toLowerCase() === "tusd" ? "tUSD" : "tUSDM";
+}
+
 const nextConfig: NextConfig = {
   reactStrictMode: true,
+  env: { NEXT_PUBLIC_SETTLEMENT_TICKER: settlementTicker(process.env) },
   // NEXT_DIST_DIR lets a verification build run while `next dev` holds .next (they must not share it).
   ...(process.env.NEXT_DIST_DIR ? { distDir: process.env.NEXT_DIST_DIR } : {}),
   // Several lockfiles exist above this folder; trace from the monorepo root.

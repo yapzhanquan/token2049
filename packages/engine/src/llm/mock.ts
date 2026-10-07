@@ -103,6 +103,29 @@ export class MockLLM implements LLM {
         if (step <= 1)
           return ["", [report(t.type === "heartbeat_missed" ? `Session ${label} went quiet (missed heartbeats).` : `Session ${label} is now ${String(t.data.to)}.`)]];
         return ["Done.", []];
+      case "session_looping":
+      case "session_stalled": {
+        // Act on every stuck session in this wake: redirect (escalation 1-2), kill at 3+.
+        if (step > 0) return ["Done.", []];
+        const stuck = [t, ...(wake.coalesced ?? [])].filter((x) => (x.type === "session_looping" || x.type === "session_stalled") && x.sessionId);
+        const calls: Omit<ToolCall, "id">[] = [];
+        for (const x of stuck) {
+          if (calls.some((c) => c.input.sessionId === x.sessionId)) continue;
+          const esc = Number(x.data.escalation ?? 1);
+          if (esc >= 3) calls.push({ name: "kill_session", input: { sessionId: x.sessionId!, reason: "stuck after repeated redirects" } });
+          else
+            calls.push({
+              name: "message_session",
+              input: { sessionId: x.sessionId!, text: esc >= 2 ? "Wrap up now: submit_handback with what you have." : `Change approach: ${String(x.data.hint ?? "stop retrying failing calls")}` },
+            });
+        }
+        return ["Redirecting the stuck session(s).", calls];
+      }
+      case "goal_completed": {
+        if (step > 0) return ["Done.", []];
+        const met = sessions.filter((x) => x.closeStatus === "COMPLETED").length;
+        return ["", [report(`Goal complete: ${met}/${sessions.length} session(s) met their definition of done.`)]];
+      }
       case "tainted":
         return step === 0 ? ["", [report(`Session ${label} read untrusted web content; its spending now needs your approval.`)]] : ["Done.", []];
       case "deposit_seen":
@@ -120,7 +143,7 @@ export class MockLLM implements LLM {
 
 interface MockState {
   handbackReviews?: Record<string, { accepted: boolean; reason?: string }>;
-  sessions?: { id: string; letter: string; role: string; status: string; contextFrom?: number[] }[];
+  sessions?: { id: string; letter: string; role: string; status: string; contextFrom?: number[]; closeStatus?: string | null }[];
 }
 
 function userMessageStep(text: string, sessions: NonNullable<MockState["sessions"]>, step: number, messages: LLMMessage[]): [string, Omit<ToolCall, "id">[]] {

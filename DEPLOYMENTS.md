@@ -29,8 +29,19 @@ The script is parameterised, so there is one script hash and one address per ses
 | 5 | `payees` | `List<Credential>` | the payment credentials of the allowed payees (≤ 10, enforced off-chain) |
 | 6 | `per_tx_max_tusd` | `Int` | micro-tUSD |
 | 7 | `ada_allowance` | `Int` | lovelace (payee min-ADA + fee per tx) |
-| 8 | `tusd_policy` | `PolicyId` | bytes (28) |
-| 9 | `tusd_name` | `AssetName` | bytes (`0014df1074555344` = CIP-68 333 "tUSD"; the demo runs before the CIP-68 migration used legacy `74555344`) |
+| 8 | `tusd_policy` | `PolicyId` | bytes (28): the **settlement asset** policy (default tUSDM `16a55b2a…22ddde`; tUSD fallback `7704eb3b…eac30`) |
+| 9 | `tusd_name` | `AssetName` | bytes: settlement asset name (default `0014df10745553444d` = CIP-68 333 "tUSDM"; tUSD fallback `0014df1074555344`; the demo runs before the CIP-68 migration used legacy `74555344`) |
+
+### Settlement asset (default tUSDM)
+
+The validator is unchanged: `tusd_policy` / `tusd_name` are parameters, so the same unapplied script (hash `edd870ab…726a`) serves any 6-decimal asset. Each session's applied script embeds the asset it was created with; Pay always uses that vault's own params, so vaults created with tUSD before the switch keep paying tUSD.
+
+| | |
+|---|---|
+| Source of truth | `SETTLEMENT_ASSET` (`tusdm` default \| `tusd`) or `SETTLEMENT_UNIT` (+ `SETTLEMENT_TICKER`) in `.env` → `@bulkhead/shared` `settlementAssetFromEnv` (`packages/shared/src/settlement.ts`) → `createChain` → `MeshTxService.tusdUnit()` (funding, balances, vault params, payments, top-ups) and `chain.settlement`. The web UI ticker comes from `next.config.ts` (`NEXT_PUBLIC_SETTLEMENT_TICKER`). The mock market matches payments in the same unit. |
+| tUSDM (preprod) | unit `16a55b2a349361ff88c03788f93e1e966e5d689605d044fef722ddde0014df10745553444d`, CIP-68 (333) "tUSDM", fingerprint `asset1mtjjpvfgtuxq3n872ptulrs25j0k4t8nd2pp2k`, **6 decimals**. VERIFIED on Blockfrost `/assets/{unit}` (onchain_metadata_standard CIP68v1, decimals 6; 2026-10-07) and in `masumi-payment-service/frontend/src/lib/constants/defaultWallets.ts` (`PREPROD_USDM_CONFIG`). |
+| Minting | tUSDM cannot be minted by Bulkhead. Custodial treasuries (and the operator, for fiat top-ups) must hold it; `operatorSend` refuses with a clear error instead of minting. With `SETTLEMENT_ASSET=tusd` the operator mints tUSD on demand as before. |
+| Offline proof | `packages/chain/test/settlement.test.ts`: tUSDM-parameterised vault applies; fund → Pay (real UPLC, Mesh offline evaluator) → Revoke; a self-custody wallet holding only tUSDM builds an unsigned vault funding tx in tUSDM; the same flow with the tUSD fallback. |
 
 Mesh 1.9.1 `addrBech32ToPlutusDataHex` leaves out the `Inline` (StakingHash) layer, so do not use it for these params. `addressToPlutusJson` in the client produces the ledger shape. The on-chain Revoke and Recover runs prove this: they require `output.address == owner`.
 

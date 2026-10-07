@@ -23,7 +23,7 @@ async function main() {
   for (const sig of ["SIGINT", "SIGTERM"] as const) process.once(sig, () => controller.abort());
 
   const cli = await locateCli();
-  const soko = new CliSokosumi({ coworkerId: cfg.coworkerId, organizationId: cfg.organizationId }, nodeCliRunner(cli), coworkerCoreLoader(cli, cfg.coworkerId));
+  const soko = new CliSokosumi({ coworkerId: cfg.coworkerId, organizationId: cfg.organizationId, organizationSlug: cfg.organizationSlug }, nodeCliRunner(cli), coworkerCoreLoader(cli, cfg.coworkerId));
   const engine = new HttpEngine(cfg.engineUrl, cfg.engineToken, fetch, 180_000);
   const gate = cfg.gate.enabled ? new MpsPaymentGate(cfg.gate) : disabledGate;
   const readiness = gate.readiness();

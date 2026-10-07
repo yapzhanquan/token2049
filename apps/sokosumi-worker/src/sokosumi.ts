@@ -36,6 +36,8 @@ export interface SokosumiConfig {
   coworkerId: string;
   /** CLI 1.0.0 needs `--organization-id`; CLI ≥ 1.0.4 uses `--personal` (default). */
   organizationId?: string;
+  /** CLI 1.0.0 `tasks` commands select an organization Workspace with `--organization-slug` (they reject --organization-id). */
+  organizationSlug?: string;
   timeoutMs?: number;
 }
 
@@ -97,8 +99,10 @@ export class CliSokosumi implements SokosumiPort {
   }
 
   async listTasks(): Promise<SokoTask[]> {
-    // `tasks list` rejects --personal (CLI 1.0.4).
-    const out = rec(await this.run(["tasks", "list", "--coworker-id", this.cfg.coworkerId]));
+    // `tasks list` rejects --personal (CLI 1.0.4) and --organization-id/--workspace-id (CLI 1.0.0);
+    // an organization Workspace is selected with --organization-slug.
+    const scope = this.cfg.organizationSlug ? ["--organization-slug", this.cfg.organizationSlug] : [];
+    const out = rec(await this.run(["tasks", "list", "--coworker-id", this.cfg.coworkerId, ...scope]));
     const tasks = Array.isArray(out.tasks) ? out.tasks : [];
     return tasks
       .map((t) => rec(t))

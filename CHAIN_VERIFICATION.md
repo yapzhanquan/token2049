@@ -259,3 +259,112 @@ Blockfrost HTTP 404 at 03:32Z = **unmeasured** (never funded), not zero. Needs t
 can buy from other Masumi agents.
 
 Not exercised: any paid payment/purchase through these keys; the Standard API on :4200 was not running.
+
+## Sokosumi Coworker E2E (2026-10-07, sokosumi-e2e agent) — details in `docs/e2e-sokosumi.md`
+
+| item | value | label |
+|---|---|---|
+| Worker treasury top-up (simulated fiat step, labelled) | 10.478723 tUSD + 25 ADA → `addr_test1qrw53vhe…s4zzkgp`, tx [a12118dd…655d78](https://preprod.cardanoscan.io/transaction/a12118dd070887e72a85ee377c7b99bec18ba053153b1baa3a9b501900655d78), block 5262987 | VERIFIED (Blockfrost `/txs` 200) |
+| Execution-only Task `01a1147a-0470-7263-b5ee-ef1c0f8cfead` | READY → RUNNING (coworker) → COMPLETED (coworker, event `01a1147c-edd5-704f-ae83-11911ee8fce7`) | VERIFIED (`sokosumi tasks get/events`) |
+| Crew session funding | 2 sessions (A researcher, B summariser), tx [6306803c…cf5093](https://preprod.cardanoscan.io/transaction/6306803c40b6e88eeef9a1c8f6a338cf0bf22464d1f9594dc9b63da731cf5093), block 5262995 | VERIFIED (Blockfrost 200) |
+| Crew session close | [8a082af3…25e9ce](https://preprod.cardanoscan.io/transaction/8a082af329d19941c352529342d8d026f00e9ed7282bb363e06cf2562b25e9ce), [1545ccee…404d17](https://preprod.cardanoscan.io/transaction/1545cceebecdaa935c89731ddf0dc1908848b8b44fce66c8917787b48d404d17), block 5262997, `valid_contract` true | VERIFIED (Blockfrost 200) |
+| Result SHA-256 (raw UTF-8) | `062e0dc760c50700def92f922383d7ce75d19aaa60bfc15206e0a60932ecae44` (5101 B) = saved file = COMPLETED event text | VERIFIED |
+| Paid Task `01a1147d-df7e-71db-9aad-2a3d5fb3e1fe` | MPS `POST /payment` HTTP 400 (`sellerReturnAddress` = empty V2 collection address from seed); no payment created (`searchQuery` → `[]`); no escrow, no on-chain tx | VERIFIED; root cause INFERRED from MPS source |
+| Escrow / submit-result / withdrawal / seller settlement | not reached | — |
+
+## Masumi buyer path (2026-10-07, masumi-buyer agent): `hire_agent` with `MARKET=masumi`
+
+Code: `packages/engine/src/market-masumi.ts` (+ `test/market-masumi.test.ts`, 25 offline tests),
+smoke script `packages/engine/scripts/masumi-hire-smoke.ts`. Sources used: MPS source
+`masumi-payment-service/src/routes/api/{purchases,payments,registry,payment-source,wallet}`, payment-core
+`blockchain-identifier.ts` / `http-exists-error.ts`, masumi skill `references/masumi-payments.md`,
+`agentic-services.md`, `api-debug-recipes.md`, and the bundled cardano-dev-skills doc
+`docs/sources/masumi/documentation/technical-documentation/agentic-service-api.mdx` (MIP-003; preferred over the
+skill where they differ). **No purchase was made**: the purchasing wallet is unfunded (Blockfrost HTTP 404), so the
+pay path is checked against source only. No preprod tx was submitted by this work.
+
+Live reads (dedicated MPS `127.0.0.1:3901`, buyer key, read-only):
+
+| call | result | label |
+|---|---|---|
+| `GET /health` (no token) | 200 `{status:"success",data:{status:"ok"}}`; any keyed route without `token` → 401 `{status:"error",error:{message}}` | VERIFIED |
+| `GET /api-key-status` | `ReadAndPay`, canRead/canPay true, canAdmin false, `NetworkLimit ["Preprod"]`, `ChainIdLimit ["cardano:preprod"]`, wallet scope = purchasing wallet `cmuxiwa790008owvc4fqcegab` (response also echoes the token: never print it) | VERIFIED |
+| `GET /wallet/list?walletType=Purchasing` | exactly one wallet, `addr_test1qr0rnnrh…pcvlyj`, vkey `de39cc77…a92c0b9`, `collectionAddress: ""` | VERIFIED |
+| `GET /payment-source` | one source: Preprod `Web3CardanoV2`, policyId `67ab0c92c4ac1610895a1c965ee50aba41a8f1513b15240723b3bd0b`, contract `addr_test1wzs4e6wc95…ftgn37w4g` | VERIFIED |
+| `GET /registry?network=Preprod[&filterPaymentSourceType=Web3CardanoV2]` | `Assets: []` — MPS lists only agents minted by its own (in-scope) wallets; the buyer key does not even see Bulkhead's own agent | VERIFIED |
+| `GET /registry/agent-identifier?…` (Bulkhead Captain) | 404 "Agent not found" (same wallet scoping) | VERIFIED |
+| `GET /purchase?network=Preprod&filterPaymentSourceType=Web3CardanoV2` | `Purchases: []` | VERIFIED |
+| `POST /purchase/resolve-blockchain-identifier` (unknown id) | 404 "Purchase not found" — the market treats 404 as "no purchase exists" | VERIFIED |
+| `GET /utxos?address=<purchasing wallet>` | 404 "Address not found" (unfunded) | VERIFIED |
+| Blockfrost `/assets/policy/67ab0c92…` + `/assets/{unit}` | 93 live registry NFTs (CIP-25 `metadata_version 2`, `supported_payment_sources[].settlement.address` = the same V2 contract) → the smoke preflight lists **27 hireable / 73 excluded** | VERIFIED |
+| Third-party sellers `GET /availability`, `/input_schema` | e.g. `expert-travel-advisor-eve.vercel.app` → `{status:"available",type:"masumi-agent",…}`, input `request` (string); Kodosumi agents use `type:"none"` info fields; one registered `apiBaseUrl` answers HTML with HTTP 200 | VERIFIED |
+
+What changed in `market-masumi.ts` and why:
+
+| change | basis | label |
+|---|---|---|
+| Discovery reads the on-chain registry (Blockfrost, `BLOCKFROST_PREPROD_PROJECT_ID`; `MASUMI_AGENT_IDS` pins ids) instead of relying on MPS `GET /registry` | live: buyer-scoped `/registry` is empty | VERIFIED |
+| Only agents purchasable on this MPS are listed: registry policy = an MPS payment-source `policyId`, and for V2 the seller's settlement contract = that source's `smartContractAddress` | `purchases/index.ts`: else 404 "No (V2) payment source found" | VERIFIED (source) |
+| CIP-25 chunked strings joined; V1 `agentPricing.fixedPricing` and V2 `supported_payment_sources[].pricing.fixed[{asset,amount}]` both mapped; first Cardano source used (as MPS does without an index) | `registry/metadata-schema.ts`, payment-core `payment-source.ts` | VERIFIED (source + live metadata) |
+| `/availability` must be JSON `status:"available"` (HTML 200 now refused); `type:"none"` schema fields skipped; `input_groups` flattened | live sellers + bundled MIP-003 doc | VERIFIED |
+| `POST /purchase` body: `blockchainIdentifier, network, inputHash, sellerVkey, agentIdentifier, Amounts, payByTime, submitResultTime, unlockTime, externalDisputeUnlockTime` (unix-ms strings), `identifierFromPurchaser` (our 20-hex nonce), `buyerReturnAddress` (always the purchasing wallet — its `collectionAddress` is `""`, and V2 uses `?? collectionAddress`), `metadata`, plus the seller's `paymentSourceType`, `supportedPaymentSourceIndex`, `paymentForceLayer`, and now **`sellerReturnAddress`** | `purchases/schemas.ts createPurchaseInitSchemaInput`; `shared.ts` re-derives the seller-signed payload incl. sellerReturnAddress / paymentForceLayer / index | VERIFIED (source); not yet posted live |
+| MPS timing rules checked before funding and again before posting (payBy ≤ submit−5 min; submit ≥ now+15 min; unlock ≥ submit+15 min; dispute ≥ unlock+15 min) | `shared.ts resolvePurchaseCreationContext` | VERIFIED (source) |
+| Seller-forced `paymentForceLayer` other than null/`L1` refused (Hydra needs an open head) | `purchases/index.ts` | VERIFIED (source) |
+| 409 "Purchase exists" carries `{id, object}` → purchase id kept | payment-core `http-exists-error.ts` + endpoint-factory | VERIFIED (source) |
+| Purchase status via `POST /purchase/resolve-blockchain-identifier` → `onChainState` (`FundsLocked…RefundWithdrawn/DisputedWithdrawn`), `NextAction {requestedAction, errorType, errorNote}`, `CurrentTransaction.status`, `resultHash`, `WithdrawnForBuyer` | `purchases/schemas.ts purchaseResponseSchema` | VERIFIED (source; 404 shape live) |
+| Lock never happened (no/failed lock tx after payByTime + 15 min) → funding returned (`funding_unused` → sweep) | `PurchasingAction` / `TransactionStatus` enums | INFERRED policy |
+| MIP-004 check: `sha256(nonce;result)` vs the seller's `/status` hash and the on-chain `resultHash` (64 hex: MPS `submit-result` only accepts 64 hex, so the skill's 128-hex "decision hash" is stale); `/status` `result` or `output` accepted; seller `failed`/`refunded` → refund request (same key that purchased — MPS requires `requestedById`) | `payments/submit-result`, `purchases/request-refund` | VERIFIED (source) |
+| Seller `start_job` response field names (`id`/`job_id`, `blockchainIdentifier`, `sellerVKey`, four times, `identifierFromPurchaser`, `input_hash`, Dynamic `amounts`) | bundled MIP-003 doc + Bulkhead's own seller; no third-party `start_job` was called (it would create a payment request on someone else's MPS) | REPORTED (doc) / INFERRED for third parties |
+
+Money path reminder (unchanged): in the engine, a Session Vault `Pay` funds the purchasing wallet with tUSD (cap =
+session mandate + `MASUMI_MAX_PRICE_TUSD`); MPS then locks the agent's own unit (tUSDM) from the wallet's float
+("equivalent" funding). Refund sweeps need an MPS admin key; without it refunds stay in the purchasing wallet
+(`unswept`) — INFERRED design, offline-tested only.
+
+Ready-to-run smoke (`masumi-hire-smoke.ts`, default `preflight` is read-only — VERIFIED run 2026-10-07: health ok,
+key scope ok, balance "unfunded", 27 hireable, picked "Hotel book expert" 1 tUSDM, availability ok):
+
+```
+pnpm --filter @bulkhead/engine exec tsx --env-file-if-exists=../../.env scripts/masumi-hire-smoke.ts preflight
+pnpm --filter @bulkhead/engine exec tsx --env-file-if-exists=../../.env scripts/masumi-hire-smoke.ts quote --agent <agentIdentifier> --input "<text>"
+pnpm --filter @bulkhead/engine exec tsx --env-file-if-exists=../../.env scripts/masumi-hire-smoke.ts buy --confirm-purchase --max 1 --agent <agentIdentifier> --input "<text>"
+```
+
+Funding needed before `buy` (send to the purchasing wallet
+`addr_test1qr0rnnrhe6tlj5cls2xcunaxvl8kgaa6henck5hjd2fvpw073tfdyz2574tg4rnazrw23t2klnd3ldlx22zdf75y7cnqpcvlyj`):
+**≥ 20 tADA** (lock tx = escrow min-UTxO, returned at settlement + 5 ADA collateral splitter self-output + fees;
+MPS `PREP_TX_MIN_LOVELACE` 7 ADA, `WALLET_SPLITTER_LOVELACE` 5 ADA) **and ≥ the price in tUSDM**, unit
+`16a55b2a349361ff88c03788f93e1e966e5d689605d044fef722ddde0014df10745553444d` (MPS
+`frontend/src/lib/constants/defaultWallets.ts` `PREPROD_USDM_CONFIG`). Suggested: 25 tADA + 2 tUSDM. The script
+refuses `buy` below `MASUMI_SMOKE_MIN_ADA` (20) or below the price.
+
+Not exercised: `POST /purchase`, escrow lock, seller result on-chain, refund, sweep — all pending funding.
+
+### Standard API (MIP-003) conformance check, `127.0.0.1:4200`
+
+Live (read-only / 4xx only; no valid `start_job` was sent to the running server): `/availability` 200
+`{status:"available",type:"masumi-agent",message}`; `/input_schema` 200 flat `input_data` (`goal`, string, min 1 /
+max 500); `/status` without `job_id` 400, unknown id 404; `/provide_input` unknown job 404; `/start_job` bad nonce
+400, array `input_data` 400; `/demo` 200 — VERIFIED, all match the bundled MIP-003 doc (`input_data` is an object
+there; the skill's `[{key,value}]` array form is older). MIP-004 hashes (`input_hash` = sha256(nonce;JCS(input)),
+`output_hash`/`result_hash` = sha256(nonce;result), 64-hex `submitResultHash`) — VERIFIED against MPS
+`submit-result` schema (64 hex) and `@bulkhead/shared/mip004` test vectors.
+
+Fixed in `standard-api.ts` (tests in `test/standard-api.test.ts`): the `start_job` quote now also returns the MPS
+`RequestedFunds` as `amounts`, and non-null `sellerReturnAddress` / `forceLayer` (as `paymentForceLayer`). Bulkhead
+Captain is registered **Dynamic**, and MPS `POST /purchase` requires the Dynamic `Amounts` (they are inside the
+seller signature), so without this no outside buyer could purchase from it — VERIFIED from source. **The running
+:4200 process still serves the old code: restart it to pick this up** (not restarted here). Also: MPS `POST /payment`
+for a Dynamic agent requires `RequestedFunds` (`payments/index.ts`, VERIFIED source), i.e. paid mode needs
+`STANDARD_MPS_PRICE_UNIT` + `STANDARD_MPS_PRICE_AMOUNT`; whether the running server sets them was not checked.
+
+## Settlement asset switch to tUSDM (2026-10-07)
+
+Bulkhead's settlement asset is now configurable (`SETTLEMENT_ASSET` / `SETTLEMENT_UNIT`, default **tUSDM**; see DEPLOYMENTS.md "Settlement asset").
+
+| Check | Result | Label |
+|---|---|---|
+| tUSDM unit `16a55b2a349361ff88c03788f93e1e966e5d689605d044fef722ddde0014df10745553444d`, CIP68v1, decimals 6, fingerprint `asset1mtjjpvfgtuxq3n872ptulrs25j0k4t8nd2pp2k` | Blockfrost `/assets/{unit}` | VERIFIED |
+| Balances at 2026-10-07T03:59:42Z (Blockfrost `/addresses/{addr}`) | operator `addr_test1qp7fqfzm…xmwku6`: 442.181738 tADA, 999,866.712770 tUSD, **0 tUSDM** · Sokosumi coworker custodial treasury `addr_test1qrw53vhedg…s4zzkgp` (user `u_4ff72b9a…`): 24.239663 tADA, 10.478723 tUSD, **0 tUSDM** · self-custody wallet `addr_test1qpyurdf6…8hmyt5`: 854.600006 tADA, 41.914892 tUSD, **2,100 tUSDM** | VERIFIED |
+| tUSDM vault: apply + fund → Pay (UPLC) → Revoke, self-custody unsigned funding in tUSDM | offline only (`packages/chain/test/settlement.test.ts`, Mesh offline evaluator) | VERIFIED offline |
+| tUSDM funding + Pay + Revoke on preprod | **not run**: the custodial treasury holds 0 tUSDM | NOT RUN |

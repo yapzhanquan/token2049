@@ -2,6 +2,7 @@
 import { FakeChainReader, HttpChainReader, type ChainReader } from "./chain-reader";
 import { Market } from "./market";
 import { KvJobStore, MemoryJobStore, type JobStore } from "./store";
+import { settlementAssetFromEnv, settlementKindFromEnv } from "@bulkhead/shared";
 import { defaultAgentWalletSource, StaticAgentWalletSource, type AgentWalletSource } from "./wallets";
 
 /** Test-mode tUSD unit: zero policy id + CIP-68 (333) "tUSD" (0014df10 74555344). Only used in fake-chain mode (MARKET_TEST_MODE=fake-chain or CHAIN=fake). */
@@ -33,10 +34,16 @@ export function marketPort(env: NodeJS.ProcessEnv = process.env): number {
 }
 
 /**
- * tUSD unit (policyId + CIP-68 (333) asset name). Order: TUSD_UNIT env → @bulkhead/chain export
- * (`tusdUnit()` function or `TUSD_UNIT` string) → null (market reports agents unavailable).
+ * The unit the market matches payments against = the engine's SETTLEMENT unit (@bulkhead/shared settlement.ts):
+ * tUSDM by default (or an explicit SETTLEMENT_UNIT). With SETTLEMENT_ASSET=tusd: TUSD_UNIT env → @bulkhead/chain
+ * export (`tusdUnit()` function or `TUSD_UNIT` string) → null (market reports agents unavailable).
  */
 export async function resolveTusdUnit(env: NodeJS.ProcessEnv = process.env): Promise<string | null> {
+  try {
+    if (settlementKindFromEnv(env) !== "tusd") return settlementAssetFromEnv(env).unit;
+  } catch {
+    return null;
+  }
   if (env.TUSD_UNIT) return normalizeTusdUnit(env.TUSD_UNIT);
   try {
     const chain = (await import("@bulkhead/chain")) as Record<string, unknown>;

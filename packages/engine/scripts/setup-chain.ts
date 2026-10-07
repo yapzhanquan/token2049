@@ -44,7 +44,10 @@ async function main() {
   const op = await chain.keys.operator();
   const unit = chain.tx.tusdUnit();
   const bal = await chain.tx.balanceOf(op.address);
-  console.log(`\nOperator: ${op.address}\n  ${explorerAddress(op.address)}\n  balance: ${ada(bal.lovelace)}, ${microToTusd(bal.tusdMicro)} tUSD (${bal.utxoCount} UTxOs)`);
+  console.log(
+    `\nOperator: ${op.address}\n  ${explorerAddress(op.address)}\n  balance: ${ada(bal.lovelace)}, ${microToTusd(bal.tusdMicro)} ${chain.settlement.ticker} (settlement asset; ${bal.utxoCount} UTxOs)`,
+  );
+  console.log(`Settlement asset: ${chain.settlement.ticker} ${unit} (SETTLEMENT_ASSET / SETTLEMENT_UNIT; default tUSDM)`);
   const token = await chain.tx.tusdTokenInfo();
   console.log(
     `tUSD (CIP-68 fungible, label 333): ${unit}\n  policy id: ${token.policyId} (native script: sig(operator payment key))` +
@@ -63,13 +66,15 @@ async function main() {
   const opUtxos = await chain.provider.fetchUtxos(op.address);
   const hasRef = opUtxos.some((u) => u.amount.some((a) => a.unit === token.referenceUnit));
   const pendingMint = db.prepare("SELECT value FROM kv WHERE key = ?").get(KV_MINT) as { value: string } | undefined;
-  if (hasRef && bal.tusdMicro > 0n) {
-    console.log(`\n✓ CIP-68 tUSD already set up (reference NFT at the operator; operator holds ${microToTusd(bal.tusdMicro)} tUSD) — skipping mint.`);
+  // Bulkhead's own tUSD held by the operator (independent of the settlement asset).
+  const opTusd = opUtxos.reduce((s, u) => s + u.amount.filter((a) => a.unit === token.unit).reduce((x, a) => x + BigInt(a.quantity), 0n), 0n);
+  if (hasRef && opTusd > 0n) {
+    console.log(`\n✓ CIP-68 tUSD already set up (reference NFT at the operator; operator holds ${microToTusd(opTusd)} tUSD) — skipping mint.`);
   } else if (pendingMint && !(await chain.provider.fetchTxConfirmation(pendingMint.value))) {
     console.log(`\n… The CIP-68 mint was already submitted and is not confirmed yet:\n  ${explorerTx(pendingMint.value)}`);
     await waitConfirmed(chain, pendingMint.value);
   } else {
-    const supply = bal.tusdMicro > 0n ? 0n : INITIAL_SUPPLY_MICRO;
+    const supply = opTusd > 0n ? 0n : INITIAL_SUPPLY_MICRO;
     const parts = [!hasRef ? "(100) reference NFT with the metadata datum → operator" : "", supply ? `${microToTusd(supply)} tUSD (333) → operator` : ""].filter(Boolean);
     console.log(`\nMinting CIP-68 tUSD: ${parts.join(" + ")}`);
     const r = await chain.tx.mintTusdCip68({ supplyMicro: supply, mintReference: !hasRef });
@@ -125,7 +130,7 @@ async function main() {
     const a = await agentWallet(i);
     console.log(`  #${i} ${a.address}\n     ${explorerAddress(a.address)}`);
   }
-  console.log(`\nSet TUSD_UNIT=${unit} in .env (CIP-68 333 unit; a legacy …74555344 value is upgraded automatically).`);
+  console.log(`\nSet TUSD_UNIT=${token.unit} in .env (CIP-68 333 unit; a legacy …74555344 value is upgraded automatically).`);
   console.log("Done.");
 }
 

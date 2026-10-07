@@ -1,16 +1,29 @@
 // Masumi market (env MARKET=masumi): Bulkhead `hire_agent` sessions hire REAL Masumi registry agents (MIP-003)
 // and pay through a Masumi Payment Service (MPS) purchase. The mock market (market.ts) stays the default.
 //
-// STATUS: INFERRED buyer flow. No Masumi demo ever implemented the buyer side (docs/SOKOSUMI-PROTOCOL.md §7);
-// every MPS route/field below is taken from the local MPS source (masumi-payment-service/src/routes/api):
-//   GET  /wallet/list?walletType=Purchasing           (read)   → the purchasing hot wallet address
-//   GET  /registry?network=Preprod[&filterPaymentSourceType=Web3CardanoV2]  (read, wallet-scoped) → RegistryEntry[]
-//   POST /purchase                                     (pay)    → lock the job price in the Masumi escrow
-//   POST /purchase/resolve-blockchain-identifier       (read)   → purchase status (onChainState, resultHash)
-//   POST /purchase/request-refund                      (pay)    → buyer refund request
+// STATUS (2026-10-07, CHAIN_VERIFICATION.md "Masumi buyer path"): request/response shapes checked against the
+// MPS source (masumi-payment-service/src/routes/api/purchases/{schemas,index,shared}.ts) and, for the read
+// routes, against the live dedicated MPS (127.0.0.1:3901) with the purchasing-wallet-scoped buyer key.
+// No purchase has been made yet (the purchasing wallet is unfunded), so the pay path is source-verified only.
+//   GET  /wallet/list?walletType=Purchasing           (read)   → the purchasing hot wallet address      [live]
+//   GET  /payment-source                               (read)   → policyId + escrow contract this MPS can buy on [live]
+//   GET  /registry?network=Preprod[…]                  (read)   → ONLY agents minted by this MPS's own wallets
+//                                                                 (managed-holder wallet scope): EMPTY for the
+//                                                                 buyer key [live]. Global discovery therefore
+//                                                                 reads the registry NFTs on-chain (Blockfrost
+//                                                                 /assets/policy + /assets/{unit} CIP-25 metadata,
+//                                                                 the same metadata MPS checks in POST /purchase).
+//   POST /purchase                                     (pay)    → lock the job price in the Masumi escrow  [source]
+//   POST /purchase/resolve-blockchain-identifier       (read)   → purchase status; 404 "Purchase not found" [live]
+//   POST /purchase/request-refund                      (pay)    → buyer refund (same key that purchased)   [source]
 //   POST /wallet/transfer-funds                        (ADMIN)  → sweep a refund out of the purchasing wallet
 //   GET  /wallet/transfer-funds?id=…                   (ADMIN)  → sweep tx status
-// Envelope: HTTP 2xx + { status: "success", data } (payment-core endpoint-factory). Header `token: <key>`.
+// Envelope: HTTP 2xx + { status: "success", data } / { status: "error", error: { message } }. Header `token`.
+// POST /purchase re-derives the seller-signed payload (MPS shared.ts resolvePurchaseCreationContext): the signature
+// covers inputHash, agentIdentifier, our nonce, Dynamic amounts, all four times, the seller's sellerReturnAddress,
+// paymentForceLayer and supportedPaymentSourceIndex, so all of them are passed back verbatim. MPS also enforces
+// payByTime ≤ submitResultTime − 5 min, submitResultTime ≥ now + 15 min, unlockTime ≥ submitResultTime + 15 min,
+// externalDisputeUnlockTime ≥ unlockTime + 15 min; we check those BEFORE any money moves.
 //
 // Money path (the user's brief §5, "fund the exact job price from the session vault"):
 //   1. startJob: MIP-003 POST {apiBaseUrl}/start_job with our hex nonce → the seller's signed terms
@@ -52,7 +65,8 @@ type FetchFn = typeof fetch;
 
 /** Planner/session payee alias that resolves to Bulkhead's MPS purchasing wallet address. */
 export const MASUMI_PURCHASING_WALLET_ALIAS = "masumi:purchasing-wallet";
-/** Masumi preprod test USDM (policy + asset name hex), docs/SOKOSUMI-PROTOCOL.md §3. */
+/** Masumi preprod test USDM (policy + asset name hex "tUSDM"): masumi-payment-service
+ * frontend/src/lib/constants/defaultWallets.ts PREPROD_USDM_CONFIG.fullAssetId; docs/SOKOSUMI-PROTOCOL.md §3. */
 export const PREPROD_TUSDM_UNIT = "16a55b2a349361ff88c03788f93e1e966e5d689605d044fef722ddde0014df10745553444d";
 
 export type FundingMode = "exact" | "equivalent";
@@ -90,6 +104,8 @@ export interface MasumiJobRecord {
     paymentSourceType?: string;
     supportedPaymentSourceIndex?: number;
     paymentForceLayer?: string | null;
+    /** Seller-chosen return address; part of the signed V2 payload when non-null. */
+    sellerReturnAddress?: string;
   };
   pricingType: "Fixed" | "Dynamic";
   amounts: { unit: string; amount: string }[];
@@ -133,6 +149,13 @@ export interface MasumiConfig {
   adminToken?: string;
   /** Optional MPS key used only for GET /registry discovery (else buyerToken; MPS scopes it to the key's wallets). */
   discoveryToken?: string;
+  /** Blockfrost preprod project id: on-chain registry discovery (the buyer key sees no MPS /registry entries). */
+  blockfrostProjectId?: string;
+  blockfrostUrl?: string;
+  /** Pin discovery to these agentIdentifiers (on-chain lookup only; no policy enumeration). */
+  agentIds?: string[];
+  /** Max registry NFTs read per on-chain enumeration (newest first). Default 100. */
+  onchainMaxAgents?: number;
   /** Optional public Masumi Registry Service (POST /registry-entry/). */
   registryUrl?: string;
   registryToken?: string;
@@ -160,6 +183,8 @@ export interface MasumiConfig {
   abandonAfterMs?: number;
   /** Seller-result grace after submitResultTime before a refund is requested. */
   resultGraceMs?: number;
+  /** After payByTime + this, a purchase whose escrow lock tx failed / never existed counts as unused funding. */
+  lockGraceMs?: number;
   watchMs?: number;
   cacheMs?: number;
   timeoutMs?: number;
@@ -263,21 +288,27 @@ export function readEnvFile(path: string): Record<string, string> {
 export interface PricedAmounts {
   pricingType: "Fixed" | "Dynamic";
   amounts: { unit: string; amount: string }[];
+  /** The selected Cardano source (V2 metadata): which escrow contract the seller settles on. */
+  settlement?: { paymentSourceType: string | null; address: string | null; index: number };
 }
 
-/** Cardano Preprod pricing of a registry entry (MPS RegistryEntry or public Registry Service entry). */
+/** Cardano Preprod pricing of a registry entry (MPS RegistryEntry, on-chain metadata, or Registry Service entry).
+ * Mirrors MPS resolveAgentPricingFromMetadata: the first Cardano source wins (MPS picks the same one when the
+ * seller signs no supportedPaymentSourceIndex). */
 export function pricingOf(entry: Rec, network: string): PricedAmounts | { error: string } {
   const sources = Array.isArray(entry.supportedPaymentSources) ? (entry.supportedPaymentSources as unknown[]).map(asRec) : [];
   if (sources.length) {
-    const s = sources.find((x) => x.chain === "Cardano" && x.network === network);
-    if (!s) return { error: `no Cardano ${network} payment source` };
+    const index = sources.findIndex((x) => x.chain === "Cardano");
+    const s = index >= 0 ? sources[index]! : null;
+    if (!s || s.network !== network) return { error: `no Cardano ${network} payment source` };
+    const settlement = { paymentSourceType: str(s.paymentSourceType) ?? null, address: str(s.address) ?? null, index };
     const p = asRec(s.pricing);
     if (p.pricingType === "Fixed") {
       const fixed = Array.isArray(p.fixed) ? (p.fixed as unknown[]).map(asRec) : [];
       const amounts = fixed.map((f) => ({ unit: normUnit(str(f.asset) ?? ""), amount: str(f.amount) ?? "" }));
-      return amounts.length ? { pricingType: "Fixed", amounts } : { error: "fixed pricing without amounts" };
+      return amounts.length ? { pricingType: "Fixed", amounts, settlement } : { error: "fixed pricing without amounts" };
     }
-    if (p.pricingType === "Dynamic") return { pricingType: "Dynamic", amounts: [] };
+    if (p.pricingType === "Dynamic") return { pricingType: "Dynamic", amounts: [], settlement };
     return { error: `pricing ${String(p.pricingType ?? "unknown")} not supported` };
   }
   const ap = asRec(entry.AgentPricing ?? entry.agentPricing);
@@ -315,14 +346,75 @@ export function toTusdMicro(amounts: { unit: string; amount: string }[], cfg: Pi
   return { micro, mode: exact ? "exact" : "equivalent" };
 }
 
+/** CIP-25 text: a string or an array of ≤64-byte chunks (MPS metadataToString). */
+const cip25 = (v: unknown): string | undefined => (typeof v === "string" ? v : Array.isArray(v) && v.every((x) => typeof x === "string") ? (v as string[]).join("") : str(v));
+
+/** On-chain Masumi registry NFT metadata (CIP-25, MPS routes/api/registry/metadata-schema.ts) → the flat
+ * registry-entry shape the catalog reads (same field names as MPS GET /registry). */
+export function registryEntryFromMetadata(agentIdentifier: string, m: Rec): Rec {
+  const onChainType = cip25(m.type);
+  const type =
+    onChainType === "a2aV1" ? "A2A" : onChainType === "x402V1" || m.x402_resources_url !== undefined ? "X402" : onChainType === "OpenAPI" || m.openapi_spec_url !== undefined ? "OpenApi" : "Standard";
+  const sources = Array.isArray(m.supported_payment_sources)
+    ? (m.supported_payment_sources as unknown[]).map(asRec).map((s) => {
+        const settlement = asRec(s.settlement);
+        const p = asRec(s.pricing);
+        const pricingType = cip25(p.pricingType);
+        return {
+          chain: cip25(s.chain),
+          network: cip25(s.network),
+          paymentSourceType: cip25(settlement.paymentSourceType),
+          address: cip25(settlement.address),
+          pricing: pricingType === "Fixed" ? { pricingType, fixed: (Array.isArray(p.fixed) ? (p.fixed as unknown[]) : []).map(asRec).map((f) => ({ asset: cip25(f.asset) ?? "", amount: cip25(f.amount) ?? "" })) } : { pricingType },
+        };
+      })
+    : null;
+  const ap = asRec(m.agentPricing);
+  const agentPricing =
+    ap.pricingType === "Fixed"
+      ? { pricingType: "Fixed", Pricing: (Array.isArray(ap.fixedPricing) ? (ap.fixedPricing as unknown[]) : []).map(asRec).map((f) => ({ unit: cip25(f.unit) ?? "", amount: str(f.amount) ?? "" })) }
+      : ap.pricingType
+        ? { pricingType: String(ap.pricingType) }
+        : null;
+  return {
+    name: cip25(m.name) ?? "agent",
+    type,
+    apiBaseUrl: cip25(m.api_base_url) ?? cip25(m.api_url),
+    agentIdentifier,
+    Tags: Array.isArray(m.tags) ? (m.tags as unknown[]).map((t) => cip25(t) ?? "").filter(Boolean) : [],
+    metadataVersion: Number(m.metadata_version ?? 1),
+    supportedPaymentSources: sources,
+    AgentPricing: sources ? null : agentPricing,
+  };
+}
+
+/** The MPS POST /purchase timing rules (shared.ts resolvePurchaseCreationContext), evaluated at `at`. */
+export function mpsTimingError(t: { payByTime: string; submitResultTime: string; unlockTime: string; externalDisputeUnlockTime: string }, at: number): string | null {
+  const [pay, submit, unlock, ext] = [t.payByTime, t.submitResultTime, t.unlockTime, t.externalDisputeUnlockTime].map(Number) as [number, number, number, number];
+  const M = 60_000;
+  if (pay > submit - 5 * M) return "payByTime must be ≥ 5 min before submitResultTime";
+  if (pay < at - 5 * M) return "payByTime is in the past";
+  if (submit < at + 15 * M) return "submitResultTime is less than 15 min away";
+  if (submit > unlock - 15 * M) return "unlockTime must be ≥ 15 min after submitResultTime";
+  if (ext < unlock + 15 * M) return "externalDisputeUnlockTime must be ≥ 15 min after unlockTime";
+  return null;
+}
+
 /** MIP-003 /input_schema → the single input field a free-text `input` goes into. */
 export function inputFieldOf(schema: unknown): string | null {
   const s = asRec(schema);
   const fields: { id: string; type: string; optional: boolean }[] = [];
-  if (Array.isArray(s.input_data)) {
-    for (const f of (s.input_data as unknown[]).map(asRec)) {
+  // MIP-003 (bundled masumi docs, agentic-service-api.mdx): flat `input_data` OR `input_groups[].input_data`.
+  const flat = Array.isArray(s.input_data)
+    ? (s.input_data as unknown[])
+    : Array.isArray(s.input_groups)
+      ? (s.input_groups as unknown[]).flatMap((g) => (Array.isArray(asRec(g).input_data) ? (asRec(g).input_data as unknown[]) : []))
+      : null;
+  if (flat) {
+    for (const f of flat.map(asRec)) {
       const id = str(f.id) ?? str(f.key);
       if (!id) continue;
+      if (f.type === "none") continue; // display-only info block (live Kodosumi/Sokosumi schemas), not an input
       const validations = Array.isArray(f.validations) ? (f.validations as unknown[]).map(asRec) : [];
       const optional = validations.some((v) => v.validation === "optional" && String(v.value) === "true");
       fields.push({ id, type: str(f.type) ?? "string", optional });
@@ -355,7 +447,12 @@ export function createMasumiMarket(cfg: MasumiConfig, deps: MasumiDeps): MasumiM
   const sweepLovelace = cfg.sweepLovelace ?? 2_000_000n;
   const abandonAfterMs = cfg.abandonAfterMs ?? 5 * 60_000;
   const resultGraceMs = cfg.resultGraceMs ?? 2 * 60_000;
+  const lockGraceMs = cfg.lockGraceMs ?? 15 * 60_000;
   const allow = cfg.agentAllowlist?.length ? new Set(cfg.agentAllowlist) : null;
+  const bf = (cfg.blockfrostUrl ?? "https://cardano-preprod.blockfrost.io/api/v0").replace(/\/+$/, "");
+  if (cfg.blockfrostProjectId && !/preprod/i.test(cfg.blockfrostUrl ?? "preprod")) throw new MasumiError("Masumi market: Blockfrost URL must be the preprod endpoint", "network");
+  /** On-chain metadata per registry NFT (unit → entry | null when burnt/unparseable), refreshed every 30 min. */
+  const metaCache = new Map<string, { at: number; entry: Rec | null }>();
 
   let cache: { at: number; list: (AgentCatalogEntry & { agentIdentifier: string })[] } | null = null;
   let report: ReturnType<MasumiMarket["discoveryReport"]> = { listed: 0, excluded: [] };
@@ -363,12 +460,12 @@ export function createMasumiMarket(cfg: MasumiConfig, deps: MasumiDeps): MasumiM
   let timer: ReturnType<typeof setInterval> | null = null;
   let ticking = false;
 
-  async function http<T>(method: string, url: string, opts: { token?: string; body?: unknown } = {}): Promise<T> {
+  async function http<T>(method: string, url: string, opts: { token?: string; body?: unknown; headers?: Record<string, string> } = {}): Promise<T> {
     const res = await f(url, {
       method,
       redirect: "error",
       signal: AbortSignal.timeout(timeoutMs),
-      headers: { "content-type": "application/json", accept: "application/json", ...(opts.token ? { token: opts.token } : {}) },
+      headers: { "content-type": "application/json", accept: "application/json", ...(opts.token ? { token: opts.token } : {}), ...opts.headers },
       ...(opts.body !== undefined ? { body: JSON.stringify(opts.body) } : {}),
     });
     const text = await res.text();
@@ -379,7 +476,9 @@ export function createMasumiMarket(cfg: MasumiConfig, deps: MasumiDeps): MasumiM
       body = text.slice(0, 300);
     }
     // Never include request headers (tokens) in errors; the URL carries no secrets.
-    if (!res.ok) throw new HttpError(`${method} ${url.replace(/\?.*$/, "")} → HTTP ${res.status}${typeof asRec(body).error === "string" ? `: ${String(asRec(body).error).slice(0, 200)}` : ""}`, res.status, body);
+    // MPS errors: { status: "error", error: { message } } (live 2026-10-07); older/other services: { error: "…" }.
+    const errMsg = str(asRec(body).error) ?? str(asRec(asRec(body).error).message);
+    if (!res.ok) throw new HttpError(`${method} ${url.replace(/\?.*$/, "")} → HTTP ${res.status}${errMsg ? `: ${errMsg.slice(0, 200)}` : ""}`, res.status, body);
     return body as T;
   }
   /** MPS call: unwraps { status: "success", data }. */
@@ -422,12 +521,69 @@ export function createMasumiMarket(cfg: MasumiConfig, deps: MasumiDeps): MasumiM
   }
 
   // ─────────── discovery ───────────
-  async function registryEntries(): Promise<Rec[]> {
+  /** The escrow sources THIS MPS can purchase on (POST /purchase 404s for any other registry policy / contract). */
+  async function paymentSources(): Promise<{ policyId: string; smartContractAddress: string; paymentSourceType: string }[]> {
+    const data = asRec(await mpsCall<unknown>("GET", "/payment-source?take=100", cfg.buyerToken));
+    return (Array.isArray(data.PaymentSources) ? (data.PaymentSources as unknown[]) : [])
+      .map(asRec)
+      .filter((p) => p.network === cfg.network && typeof p.policyId === "string" && typeof p.smartContractAddress === "string")
+      .map((p) => ({ policyId: String(p.policyId).toLowerCase(), smartContractAddress: String(p.smartContractAddress), paymentSourceType: str(p.paymentSourceType) ?? "Web3CardanoV1" }));
+  }
+
+  /** One registry NFT's on-chain metadata (Blockfrost /assets/{unit}), cached. */
+  async function onchainEntry(unit: string): Promise<Rec | null> {
+    const hit = metaCache.get(unit);
+    if (hit && now() - hit.at < 30 * 60_000) return hit.entry;
+    let entry: Rec | null = null;
+    try {
+      const a = asRec(await http<unknown>("GET", `${bf}/assets/${unit}`, { headers: { project_id: cfg.blockfrostProjectId! } }));
+      const meta = asRec(a.onchain_metadata);
+      if (str(a.quantity) !== "0" && Object.keys(meta).length) entry = { ...registryEntryFromMetadata(unit, meta), __src: "chain" };
+    } catch (e) {
+      if (!(e instanceof HttpError && e.status === 404)) throw e;
+    }
+    metaCache.set(unit, { at: now(), entry });
+    return entry;
+  }
+
+  async function onchainEntries(policies: string[]): Promise<Rec[]> {
+    const units: string[] = [];
+    if (cfg.agentIds?.length) units.push(...cfg.agentIds);
+    else {
+      const max = cfg.onchainMaxAgents ?? 100;
+      for (const policy of policies) {
+        for (let page = 1; units.length < max && page <= 10; page++) {
+          const list = await http<unknown>("GET", `${bf}/assets/policy/${policy}?count=100&page=${page}&order=desc`, { headers: { project_id: cfg.blockfrostProjectId! } }).catch((e) => {
+            if (e instanceof HttpError && e.status === 404) return [];
+            throw e;
+          });
+          const rows = (Array.isArray(list) ? list : []).map(asRec);
+          for (const r of rows) if (str(r.quantity) !== "0" && typeof r.asset === "string" && units.length < max) units.push(r.asset);
+          if (rows.length < 100) break;
+        }
+      }
+    }
+    const out: Rec[] = [];
+    for (const u of units.filter((u) => !allow || allow.has(u))) {
+      const e = await onchainEntry(u);
+      if (e) out.push(e);
+    }
+    return out;
+  }
+
+  async function registryEntries(policies: string[]): Promise<Rec[]> {
     const out: Rec[] = [];
     const errors: string[] = [];
+    if (cfg.blockfrostProjectId) {
+      try {
+        out.push(...(await onchainEntries(policies)));
+      } catch (e) {
+        errors.push(`on-chain registry: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    }
     if (cfg.registryUrl) {
       try {
-        const body = asRec(await http<unknown>("POST", `${cfg.registryUrl.replace(/\/+$/, "")}/registry-entry/`, { ...(cfg.registryToken ? { token: cfg.registryToken } : {}), body: { network: cfg.network, filter: { status: ["Online"], paymentTypes: ["Web3CardanoV1"] }, limit: 50 } }));
+        const body = asRec(await http<unknown>("POST", `${cfg.registryUrl.replace(/\/+$/, "")}/registry-entry/`, { ...(cfg.registryToken ? { token: cfg.registryToken } : {}), body: { network: cfg.network, filter: { status: ["Online"] }, limit: 50 } }));
         const data = body.data ?? body;
         const d = asRec(data);
         const list = Array.isArray(data) ? data : (d.entries ?? d.Entries ?? d.Assets ?? d.items ?? []);
@@ -452,10 +608,17 @@ export function createMasumiMarket(cfg: MasumiConfig, deps: MasumiDeps): MasumiM
   async function catalog(): Promise<AgentCatalogEntry[]> {
     if (cache && now() - cache.at < (cfg.cacheMs ?? 60_000)) return cache.list;
     const addr = await purchasingWallet();
+    let sources: Awaited<ReturnType<typeof paymentSources>>;
+    try {
+      sources = await paymentSources();
+    } catch (e) {
+      throw new MasumiError(`Masumi discovery: MPS payment sources unreadable: ${e instanceof Error ? e.message : String(e)}`, "discovery");
+    }
     const excluded: { name: string; agentIdentifier: string | null; reason: string }[] = [];
     const list: (AgentCatalogEntry & { agentIdentifier: string })[] = [];
     const seen = new Set<string>();
-    for (const e of await registryEntries()) {
+    if (!sources.length) throw new MasumiError("Masumi discovery: this MPS has no Preprod payment source", "discovery");
+    for (const e of await registryEntries([...new Set(sources.map((s) => s.policyId))])) {
       const name = firstStr(e, "name") ?? "agent";
       const agentIdentifier = firstStr(e, "agentIdentifier", "agent_identifier", "assetIdentifier") ?? null;
       const no = (reason: string) => excluded.push({ name, agentIdentifier, reason });
@@ -497,6 +660,19 @@ export function createMasumiMarket(cfg: MasumiConfig, deps: MasumiDeps): MasumiM
       const pr = pricingOf(e, cfg.network);
       if ("error" in pr) {
         no(pr.error);
+        continue;
+      }
+      // Purchasable on THIS MPS? POST /purchase looks up a payment source by the agent's registry policy (V1) or
+      // by policy + the signed escrow contract address (V2) and 404s otherwise (purchases/index.ts).
+      const policy = agentIdentifier.slice(0, 56).toLowerCase();
+      const onPolicy = sources.filter((s) => s.policyId === policy);
+      const v2 = pr.settlement ? pr.settlement.paymentSourceType === "Web3CardanoV2" : false;
+      if (!onPolicy.length) {
+        no("registry policy has no payment source on this MPS");
+        continue;
+      }
+      if (v2 ? !onPolicy.some((s) => s.paymentSourceType === "Web3CardanoV2" && s.smartContractAddress === pr.settlement!.address) : !onPolicy.some((s) => s.paymentSourceType === "Web3CardanoV1")) {
+        no(v2 ? "seller's V2 escrow contract is not configured on this MPS" : "no V1 payment source on this MPS");
         continue;
       }
       let priceTUSD = "0";
@@ -558,8 +734,10 @@ export function createMasumiMarket(cfg: MasumiConfig, deps: MasumiDeps): MasumiM
     }
     const api = entry.endpoint;
     try {
+      // Live sellers answer { status: "available", type: "masumi-agent", message }; anything else (incl. an HTML
+      // page served with 200, seen live on a registered apiBaseUrl) is not a MIP-003 agent.
       const av = asRec(await http<unknown>("GET", `${api}/availability`));
-      if (av.status && av.status !== "available") throw new MasumiError(`agent unavailable: ${String(av.message ?? av.status).slice(0, 120)}`, "unavailable");
+      if (av.status !== "available") throw new MasumiError(`agent unavailable: ${String(av.message ?? av.status ?? "no MIP-003 /availability JSON").slice(0, 120)}`, "unavailable");
     } catch (e) {
       if (e instanceof MasumiError) throw e;
       throw new MasumiError(`agent availability check failed: ${e instanceof Error ? e.message : String(e)}`, "unavailable");
@@ -595,7 +773,16 @@ export function createMasumiMarket(cfg: MasumiConfig, deps: MasumiDeps): MasumiM
     if (echoed && echoed !== nonce) fail("identifierFromPurchaser echo does not match our nonce");
     const sellerInputHash = firstStr(resp, "input_hash", "inputHash");
     if (sellerInputHash && sellerInputHash.toLowerCase() !== inputHash) fail("seller input_hash does not match our MIP-004 input hash", "input_hash_mismatch");
+    if (!/^[0-9a-f]+$/i.test(blockchainIdentifier!) || blockchainIdentifier!.length > 8000) fail("blockchainIdentifier is not the hex MPS identifier");
     if (Number(payByTime) < now() + minPayWindowMs) fail(`payByTime leaves less than ${Math.round(minPayWindowMs / 60_000)} min to fund the purchase`, "deadline");
+    // MPS re-checks these at POST /purchase time (after our funding confirmed): check them as of then, too.
+    const timing = { payByTime: payByTime!, submitResultTime: submitResultTime!, unlockTime: unlockTime!, externalDisputeUnlockTime: externalDisputeUnlockTime! };
+    const timingErr = mpsTimingError(timing, now()) ?? mpsTimingError(timing, now() + minPayWindowMs);
+    if (timingErr) fail(`MPS would refuse these terms: ${timingErr}`, "deadline");
+    const forceLayer = resp.paymentForceLayer !== undefined ? resp.paymentForceLayer : resp.forceLayer;
+    if (forceLayer !== undefined && forceLayer !== null && forceLayer !== "L1") fail(`seller forces settlement layer ${String(forceLayer).slice(0, 20)} (only L1 purchases are supported)`, "bad_terms");
+    const sellerReturnAddress = firstStr(resp, "sellerReturnAddress", "seller_return_address");
+    if (sellerReturnAddress && !/^addr_test1[0-9a-z]+$/.test(sellerReturnAddress)) fail("sellerReturnAddress is not a preprod address", "network");
 
     let amounts: { unit: string; amount: string }[];
     const quoted = [resp.amounts, resp.Amounts, resp.RequestedFunds, resp.requestedFunds, resp.requested_funds].find((x) => Array.isArray(x)) as unknown[] | undefined;
@@ -634,7 +821,8 @@ export function createMasumiMarket(cfg: MasumiConfig, deps: MasumiDeps): MasumiM
         externalDisputeUnlockTime: externalDisputeUnlockTime!,
         ...(pst ? { paymentSourceType: pst } : {}),
         ...(typeof spsi === "number" ? { supportedPaymentSourceIndex: spsi } : {}),
-        ...(resp.paymentForceLayer !== undefined ? { paymentForceLayer: (str(resp.paymentForceLayer) ?? null) as string | null } : {}),
+        ...(forceLayer !== undefined ? { paymentForceLayer: (str(forceLayer) ?? null) as string | null } : {}),
+        ...(sellerReturnAddress ? { sellerReturnAddress } : {}),
       },
       pricingType: entry.pricingType === "Dynamic" ? "Dynamic" : "Fixed",
       amounts,
@@ -663,6 +851,12 @@ export function createMasumiMarket(cfg: MasumiConfig, deps: MasumiDeps): MasumiM
   }
 
   async function createPurchase(r: MasumiJobRecord, addr: string) {
+    const late = mpsTimingError(r.terms, now());
+    if (late) {
+      // MPS would answer 400 anyway; don't post terms it must refuse.
+      setPhase(r, "funding_unused", { error: `purchase not posted: ${late}` });
+      return;
+    }
     setPhase(r, "purchase_pending");
     const body = {
       network: cfg.network,
@@ -682,13 +876,15 @@ export function createMasumiMarket(cfg: MasumiConfig, deps: MasumiDeps): MasumiM
       ...(r.terms.paymentSourceType ? { paymentSourceType: r.terms.paymentSourceType } : {}),
       ...(r.terms.supportedPaymentSourceIndex !== undefined ? { supportedPaymentSourceIndex: r.terms.supportedPaymentSourceIndex } : {}),
       ...(r.terms.paymentForceLayer !== undefined ? { paymentForceLayer: r.terms.paymentForceLayer } : {}),
+      ...(r.terms.sellerReturnAddress ? { sellerReturnAddress: r.terms.sellerReturnAddress } : {}),
     };
     try {
       const p = asRec(await mpsCall<unknown>("POST", "/purchase", cfg.buyerToken, body));
       setPhase(r, "purchased", { purchaseId: str(p.id) ?? "" });
     } catch (e) {
       if (e instanceof HttpError && e.status === 409) {
-        setPhase(r, "purchased"); // "Purchase exists" — MPS dedupes on blockchainIdentifier
+        // "Purchase exists" (HttpExistsError: 409 + { id, object }) — MPS dedupes on blockchainIdentifier.
+        setPhase(r, "purchased", { purchaseId: str(asRec(e.body).id) ?? r.purchaseId ?? "" });
         return;
       }
       if (e instanceof HttpError && e.status >= 400 && e.status < 500) {
@@ -792,7 +988,17 @@ export function createMasumiMarket(cfg: MasumiConfig, deps: MasumiDeps): MasumiM
         return { status: "failed" };
       }
       if (next.errorType && fromPoll) emit("error", r.sessionId, { kind: "masumi_purchase_error", jobId: r.jobId, errorType: next.errorType, note: str(next.errorNote)?.slice(0, 200) ?? null });
-      if (!st) return { status: "awaiting_payment" }; // not locked yet
+      if (!st) {
+        // Not locked yet. Once payByTime + grace has passed with no lock tx (or only a failed one), the escrow lock
+        // can no longer happen (MPS lock txs must land before payByTime): the funding was not used.
+        const tx = asRec(p.CurrentTransaction);
+        const txDead = !p.CurrentTransaction || ["FailedViaTimeout", "FailedViaManualReset", "RolledBack"].includes(str(tx.status) ?? "");
+        if (t > Number(r.terms.payByTime) + lockGraceMs && txDead) {
+          setPhase(r, "funding_unused", { error: `escrow lock never happened (${str(next.requestedAction) ?? "?"}${next.errorType ? `, ${String(next.errorType)}` : ""})` });
+          return { status: "failed" };
+        }
+        return { status: "awaiting_payment" };
+      }
       // Escrow is locked (or further): ask the seller.
       let s: Rec = {};
       try {
@@ -801,13 +1007,15 @@ export function createMasumiMarket(cfg: MasumiConfig, deps: MasumiDeps): MasumiM
         /* transient */
       }
       const sellerStatus = str(s.status);
-      if (sellerStatus === "failed") {
-        await requestRefund(r, "seller reported the job failed");
+      if (sellerStatus === "failed" || sellerStatus === "refunded") {
+        await requestRefund(r, `seller reported the job ${sellerStatus}`);
         return { status: "failed" };
       }
-      const onChainHash = str(p.resultHash) ?? null;
-      if (sellerStatus === "completed" && s.result !== undefined) {
-        const result = typeof s.result === "string" ? s.result : JSON.stringify(s.result);
+      const onChainHash = str(p.resultHash) || null;
+      // MIP-003 /status: Bulkhead/Sokosumi sellers send `result`, the masumi skill's agentic-services.md `output`.
+      const out = s.result !== undefined && s.result !== null ? s.result : s.output;
+      if (sellerStatus === "completed" && out !== undefined && out !== null) {
+        const result = typeof out === "string" ? out : JSON.stringify(out);
         if (requireOnChainResult && !onChainHash) {
           if (t > Number(r.terms.submitResultTime) + resultGraceMs) {
             await requestRefund(r, "no result hash on-chain by submitResultTime");
@@ -993,6 +1201,10 @@ export function masumiConfigFromEnv(env: NodeJS.ProcessEnv, tusdUnit: string, re
     buyerToken,
     ...(adminToken ? { adminToken } : {}),
     ...(env.MPS_DISCOVERY_TOKEN ?? buyerFile.MPS_DISCOVERY_TOKEN ? { discoveryToken: env.MPS_DISCOVERY_TOKEN ?? buyerFile.MPS_DISCOVERY_TOKEN } : {}),
+    // On-chain discovery (default ON when a Blockfrost preprod key exists; MASUMI_ONCHAIN_DISCOVERY=0 disables).
+    ...(env.BLOCKFROST_PREPROD_PROJECT_ID && env.MASUMI_ONCHAIN_DISCOVERY !== "0" ? { blockfrostProjectId: env.BLOCKFROST_PREPROD_PROJECT_ID } : {}),
+    ...(env.MASUMI_AGENT_IDS ? { agentIds: env.MASUMI_AGENT_IDS.split(",").map((s) => s.trim()).filter(Boolean) } : {}),
+    ...(env.MASUMI_ONCHAIN_MAX_AGENTS ? { onchainMaxAgents: Number(env.MASUMI_ONCHAIN_MAX_AGENTS) } : {}),
     ...(env.MASUMI_REGISTRY_URL ? { registryUrl: env.MASUMI_REGISTRY_URL } : {}),
     ...(env.REGISTRY_API_KEY ? { registryToken: env.REGISTRY_API_KEY } : {}),
     ...(env.MASUMI_PURCHASING_WALLET_ADDRESS ? { purchasingWalletAddress: env.MASUMI_PURCHASING_WALLET_ADDRESS } : {}),

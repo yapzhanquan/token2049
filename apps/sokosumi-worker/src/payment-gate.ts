@@ -38,6 +38,31 @@ export interface PaymentGate {
   resolve(blockchainIdentifier: string): Promise<MpsPayment>;
   /** POST /api/v1/payment/submit-result. */
   submitResult(blockchainIdentifier: string, resultHash: string): Promise<MpsPayment>;
+  /** Read-only inspection: GET /api/v1/payment?searchQuery=<inputHash> (payments with that input hash). */
+  findPayments(inputHash: string): Promise<MpsPayment[]>;
+}
+
+/**
+ * MPS answered with an HTTP error and an MPS error body. MPS validates a request before it writes
+ * anything, so a 4xx refusal means the request did not apply. Network errors, timeouts and 5xx are
+ * not covered here and stay uncertain.
+ */
+export class MpsHttpError extends Error {
+  constructor(
+    readonly status: number,
+    readonly mpsMessage: string,
+    message: string,
+  ) {
+    super(message);
+  }
+  /** Refused before any write. */
+  get refused(): boolean {
+    return this.status >= 400 && this.status < 500 && this.status !== 408 && this.status !== 429;
+  }
+  /** Refused for a reason that repeating the same request cannot fix. */
+  get deterministic(): boolean {
+    return [400, 404, 409, 422].includes(this.status);
+  }
 }
 
 /** Escrow/result proof: the state must have been reached by a CONFIRMED transaction. */
@@ -113,22 +138,31 @@ export class MpsPaymentGate implements PaymentGate {
     return t;
   }
 
-  private async post(path: string, body: unknown): Promise<MpsPayment> {
+  private async call<T>(method: "GET" | "POST", path: string, body?: unknown): Promise<T> {
     const res = await (this.cfg.fetchImpl ?? fetch)(`${this.cfg.mpsUrl!.replace(/\/+$/, "")}/api/v1${path}`, {
-      method: "POST",
+      method,
       redirect: "error",
       signal: AbortSignal.timeout(30_000),
       headers: { "content-type": "application/json", token: this.token() },
-      body: JSON.stringify(body),
+      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
     });
-    let data: { status?: string; data?: MpsPayment } = {};
+    let data: { status?: string; data?: T; error?: { message?: unknown } } = {};
     try {
       data = (await res.json()) as typeof data;
     } catch {
       /* fallthrough */
     }
-    if (!res.ok || data.status !== "success" || !data.data) throw new Error(`MPS ${path} failed (HTTP ${res.status}). Inspect saved state before retry.`);
+    const route = path.split("?")[0];
+    if (!res.ok && data.status === "error") {
+      // MPS error messages are validation text (no secrets); clipped.
+      const msg = String(data.error?.message ?? "").replace(/\s+/g, " ").slice(0, 200);
+      throw new MpsHttpError(res.status, msg, `MPS ${route} failed (HTTP ${res.status}): ${msg}`);
+    }
+    if (!res.ok || data.status !== "success" || !data.data) throw new Error(`MPS ${route} failed (HTTP ${res.status}). Inspect saved state before retry.`);
     return data.data;
+  }
+  private post(path: string, body: unknown): Promise<MpsPayment> {
+    return this.call<MpsPayment>("POST", path, body);
   }
 
   requestTerms(r: TermsRequest) {
@@ -155,6 +189,12 @@ export class MpsPaymentGate implements PaymentGate {
     if (!/^[0-9a-f]{64}$/.test(resultHash)) throw new Error("submitResultHash must be 64 hex chars");
     return this.post("/payment/submit-result", { network: "Preprod", blockchainIdentifier, submitResultHash: resultHash });
   }
+  async findPayments(inputHash: string) {
+    if (!/^[0-9a-f]{64}$/.test(inputHash)) throw new Error("inputHash must be 64 hex chars");
+    const q = new URLSearchParams({ network: "Preprod", limit: "100", searchQuery: inputHash });
+    const d = await this.call<{ Payments?: MpsPayment[] }>("GET", `/payment?${q}`);
+    return (d.Payments ?? []).filter((p) => p.inputHash === inputHash);
+  }
 }
 
 /** A gate that is never ready (execution-only operation). */
@@ -166,4 +206,5 @@ export const disabledGate: PaymentGate = {
   requestTerms: () => Promise.reject(new Error("paid Tasks disabled")),
   resolve: () => Promise.reject(new Error("paid Tasks disabled")),
   submitResult: () => Promise.reject(new Error("paid Tasks disabled")),
+  findPayments: () => Promise.reject(new Error("paid Tasks disabled")),
 };

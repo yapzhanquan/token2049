@@ -11,6 +11,7 @@ import { FinalityProvider, confirmationsFromEnv } from "./finality";
 import { handleResolverFromEnv } from "./handle";
 import { sqliteStores, type ChainStores } from "./store";
 import { SLOT_CONFIG_NETWORK, slotToBeginUnixTime, unixTimeToEnclosingSlot, ensureCryptoReady } from "./mesh";
+import { settlementAssetFromEnv, settlementKindFromEnv, type SettlementAsset } from "@bulkhead/shared";
 
 export * from "./types";
 export { createProvider, createMainnetProvider, BlockfrostProvider, KoiosProvider, NOWNodesProvider, BlockfrostCompatProvider, HttpError } from "./providers";
@@ -52,6 +53,12 @@ export interface ChainEnv {
   NOWNODES_API_KEY?: string;
   OGMIOS_URL?: string;
   TUSD_UNIT?: string;
+  /** Settlement asset: "tusdm" (default, Masumi/Sokosumi preprod tUSDM) | "tusd" (Bulkhead's own minted tUSD). */
+  SETTLEMENT_ASSET?: string;
+  /** Explicit settlement unit (policyId + asset name hex); wins over SETTLEMENT_ASSET. */
+  SETTLEMENT_UNIT?: string;
+  /** Display ticker for a custom SETTLEMENT_UNIT. */
+  SETTLEMENT_TICKER?: string;
   /** Blocks on top before a tx counts as confirmed (default 2). */
   CONFIRMATIONS?: string;
 }
@@ -71,6 +78,8 @@ export interface ChainConfig {
   confirmations?: number;
   /** ADA Handle resolver (default: from env; null disables). */
   handles?: HandleResolver | null;
+  /** Override the settlement asset (tests). Default: settlementAsset(env). */
+  settlement?: SettlementAsset;
 }
 
 export interface BulkheadChain extends Chain {
@@ -78,6 +87,8 @@ export interface BulkheadChain extends Chain {
   tx: MeshTxService;
   watcher: PollingChainWatcher;
   queue: TreasuryQueue;
+  /** The asset every budget / funding output / vault param / payment / balance is denominated in. */
+  settlement: SettlementAsset;
 }
 
 export const slotFromTime = (ms: number): number => unixTimeToEnclosingSlot(ms, SLOT_CONFIG_NETWORK.preprod);
@@ -100,7 +111,9 @@ export async function createChain(config: ChainConfig = {}): Promise<BulkheadCha
   const stores = config.stores ?? sqliteStores((await import("@bulkhead/db")).rawSqlite());
   const keys = new KeyVault({ masterSecret: env.MASTER_SECRET ?? "", operatorMnemonic: env.OPERATOR_MNEMONIC, repo: stores.keys, kv: stores.kv });
   const queue = new TreasuryQueue();
+  const settlement = config.settlement ?? (await settlementAsset(env));
   const tx = new MeshTxService({
+    settlementUnit: settlement.unit,
     provider,
     keys,
     sessions: stores.sessions,
@@ -108,12 +121,12 @@ export async function createChain(config: ChainConfig = {}): Promise<BulkheadCha
     ttlSlots: config.ttlSlots,
     evaluateBeforeSubmit: config.evaluateBeforeSubmit,
   });
-  if (env.OPERATOR_MNEMONIC?.trim()) await tx.tusdUnitAsync();
+  if (env.OPERATOR_MNEMONIC?.trim()) await tx.operatorTusdUnitAsync();
   const watcher = new PollingChainWatcher({ provider: baseProvider, kv: stores.kv, pollMs: config.pollMs, ogmiosUrl: env.OGMIOS_URL, log: config.log, confirmations });
   watcher.on((e) => {
     if (e.type === "tx_confirmed") queue.confirm(e.txHash);
   });
-  return { provider, mainnetProvider, watcher, keys, tx, queue, buildSessionScript, slotFromTime, timeFromSlot, addressKeyHashes, confirmations, handles };
+  return { provider, mainnetProvider, watcher, keys, tx, queue, settlement, buildSessionScript, slotFromTime, timeFromSlot, addressKeyHashes, confirmations, handles };
 }
 
 /**
@@ -126,6 +139,22 @@ export async function tusdUnit(env: ChainEnv = process.env as ChainEnv): Promise
   if (!env.OPERATOR_MNEMONIC?.trim()) throw new Error("tusdUnit: OPERATOR_MNEMONIC (or TUSD_UNIT) is not set");
   const op = await operatorKeyFromMnemonic(env.OPERATOR_MNEMONIC);
   return tusdPolicy(op.keyHash).policyId + TUSD_ASSET_NAME_HEX;
+}
+
+/**
+ * Settlement asset from env (default tUSDM). The operator's tUSD unit is only resolved when SETTLEMENT_ASSET=tusd or
+ * a SETTLEMENT_UNIT is set (TUSD_UNIT, else derived from OPERATOR_MNEMONIC).
+ */
+export async function settlementAsset(env: ChainEnv = process.env as ChainEnv): Promise<SettlementAsset> {
+  const kind = settlementKindFromEnv(env);
+  let tusd: string | null = null;
+  if (kind !== "tusdm" && (env.TUSD_UNIT?.trim() || env.OPERATOR_MNEMONIC?.trim())) tusd = await tusdUnit(env);
+  return settlementAssetFromEnv(env, { tusdUnit: tusd });
+}
+
+/** Settlement unit (policyId + asset name hex) from env; what sessions pay agents with. */
+export async function settlementUnit(env: ChainEnv = process.env as ChainEnv): Promise<string> {
+  return (await settlementAsset(env)).unit;
 }
 
 /** Mock paid-agent wallet i (0..2 for the market) — derived from MASTER_SECRET, account 1000002', index i. */

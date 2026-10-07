@@ -52,4 +52,22 @@ describe("CLI argv", () => {
     await old.startTask("t1");
     expect(argv.at(-1)).toEqual(["runtime", "start", "t1", "--organization-id", "org1", "--coworker-id", "cw"]);
   });
+  it("CLI 1.0.0: tasks list selects the organization by slug, runtime by id", async () => {
+    const argv: string[][] = [];
+    const run = async (a: string[]) => {
+      argv.push(a);
+      if (a[0] === "tasks") return { tasks: [] };
+      if (a[1] === "start") return { id: "t1", name: "n", description: "input", status: "RUNNING" };
+      return { taskId: "t1", eventId: "e1", status: "COMPLETED" };
+    };
+    const s = new CliSokosumi({ coworkerId: "cw", organizationId: "org1", organizationSlug: "bulkhead-x" }, run, async () => pagedCore({}));
+    await s.listTasks();
+    await s.completeTask("t1", "/r.txt");
+    expect(argv).toEqual([
+      ["tasks", "list", "--coworker-id", "cw", "--organization-slug", "bulkhead-x"],
+      ["runtime", "complete", "t1", "--organization-id", "org1", "--coworker-id", "cw", "--result-file", "/r.txt"],
+    ]);
+    // tasks commands never get --organization-id / --workspace-id (CLI 1.0.0 rejects them)
+    expect(argv[0]).not.toContain("--organization-id");
+  });
 });

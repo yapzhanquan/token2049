@@ -104,6 +104,12 @@ export interface PaymentQuote {
   externalDisputeUnlockTime: number;
   paymentSourceType?: string;
   supportedPaymentSourceIndex?: number;
+  /** MPS RequestedFunds. For Dynamic pricing these amounts are part of the seller signature and a buyer's
+   * POST /purchase must send them back as `Amounts` (MPS purchases/shared.ts), so they go into the quote. */
+  amounts?: { unit: string; amount: string }[];
+  /** Non-null MPS sellerReturnAddress / forceLayer are signed into the blockchainIdentifier payload too. */
+  sellerReturnAddress?: string;
+  paymentForceLayer?: string;
 }
 export interface PaymentObservation {
   onChainState: string | null;
@@ -398,6 +404,10 @@ export function createStandardApi(deps: StandardApiDeps) {
       input_hash: inputHash,
       ...(quote.paymentSourceType ? { paymentSourceType: quote.paymentSourceType } : {}),
       ...(quote.supportedPaymentSourceIndex !== undefined ? { supportedPaymentSourceIndex: quote.supportedPaymentSourceIndex } : {}),
+      // Signed terms a buyer must echo in MPS POST /purchase (not listed in the MIP-003 doc, required by MPS).
+      ...(quote.amounts?.length ? { amounts: quote.amounts } : {}),
+      ...(quote.sellerReturnAddress ? { sellerReturnAddress: quote.sellerReturnAddress } : {}),
+      ...(quote.paymentForceLayer ? { paymentForceLayer: quote.paymentForceLayer } : {}),
     };
     job = save(job, { phase: "awaiting-payment", payment: quote, response, deadline: quote.submitResultTime });
     return c.json(response);
@@ -646,6 +656,8 @@ export function createMpsPayments(o: MpsPaymentsOptions): StandardPayments {
       if (src?.network && src.network !== "Preprod") throw new Error("MPS payment source is not Preprod");
       const wallet = data.SmartContractWallet as { walletVkey?: string } | null | undefined;
       if (typeof data.blockchainIdentifier !== "string" || !data.blockchainIdentifier) throw new Error("MPS returned no blockchainIdentifier");
+      const funds = Array.isArray(data.RequestedFunds) ? (data.RequestedFunds as { unit?: unknown; amount?: unknown }[]) : [];
+      const amounts = funds.filter((f) => typeof f?.amount === "string" && typeof f.unit === "string").map((f) => ({ unit: f.unit as string, amount: f.amount as string }));
       return {
         blockchainIdentifier: data.blockchainIdentifier,
         agentIdentifier: String(data.agentIdentifier ?? o.agentIdentifier),
@@ -657,6 +669,9 @@ export function createMpsPayments(o: MpsPaymentsOptions): StandardPayments {
         externalDisputeUnlockTime: ms(data.externalDisputeUnlockTime),
         ...(src?.paymentSourceType ? { paymentSourceType: src.paymentSourceType } : {}),
         ...(o.supportedPaymentSourceIndex !== undefined ? { supportedPaymentSourceIndex: o.supportedPaymentSourceIndex } : {}),
+        ...(amounts.length ? { amounts } : {}),
+        ...(typeof data.sellerReturnAddress === "string" && data.sellerReturnAddress ? { sellerReturnAddress: data.sellerReturnAddress } : {}),
+        ...(typeof data.forceLayer === "string" && data.forceLayer ? { paymentForceLayer: data.forceLayer } : {}),
       };
     },
     async getPayment(blockchainIdentifier) {

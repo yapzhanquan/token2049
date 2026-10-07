@@ -9,7 +9,7 @@ import { EngineHttpError, type EnginePort } from "./engine";
 import type { HashRule } from "./hash";
 import { matchSession, parseIntent } from "./intents";
 import type { JournalStore } from "./journal";
-import { buildPurchasePayload, confirmedState, escrowConfirmed, TUSDM_UNIT, type PaymentGate } from "./payment-gate";
+import { buildPurchasePayload, confirmedState, escrowConfirmed, MpsHttpError, TUSDM_UNIT, type PaymentGate } from "./payment-gate";
 import { parseOrder, type QuoteConfig } from "./quote";
 import { buildResultText, computeLedger, statusText, type CrewSnapshot } from "./report";
 import { verifySettlement, type TxUtxos } from "./settlement";
@@ -17,6 +17,8 @@ import { clip, type SokosumiPort } from "./sokosumi";
 import type { CommentRecord, MpsPayment, SokoTask, TaskJournal } from "./types";
 
 const MIN = 60_000;
+/** A terms-pending marker is inspected only after this long (no request still in flight). */
+export const TERMS_INSPECT_GRACE_MS = 2 * MIN;
 
 export interface RunnerConfig {
   quote: QuoteConfig;
@@ -189,15 +191,44 @@ export class TaskRunner {
         externalDisputeUnlockTime: new Date(submit + 32 * MIN),
         metadata: JSON.stringify({ taskId: j.taskId, hashRule: this.d.hashRule.name }),
       };
-      j.payment = { stage: "terms-pending", nonce: request.identifierFromPurchaser, request: { ...request, hashRule: this.d.hashRule.name } };
+      j.payment = { stage: "terms-pending", nonce: request.identifierFromPurchaser, request: { ...request, hashRule: this.d.hashRule.name }, requestedAt: now };
       this.save(j);
-      const payment = await gate.requestTerms(request);
+      let payment: MpsPayment;
+      try {
+        payment = await gate.requestTerms(request);
+      } catch (e) {
+        if (e instanceof MpsHttpError && e.refused) {
+          // MPS refused before creating anything: the request did not apply. Roll the marker back.
+          delete j.payment;
+          this.save(j);
+          if (e.deterministic) throw new FatalTaskError(`the payment service refused the payment request (HTTP ${e.status}: ${e.mpsMessage}); nothing was charged`);
+        }
+        throw e;
+      }
       j.payment = { ...j.payment, stage: "terms-saved", payment }; // saved verbatim BEFORE validation
       return this.save(j);
     }
     switch (p.stage) {
-      case "terms-pending":
-        throw new UncertainWriteError(`Task ${j.taskId}: payment terms request outcome unknown; inspect MPS before any retry`);
+      case "terms-pending": {
+        // Outcome of POST /payment unknown. Inspection: MPS payments with this Task's input hash + metadata.
+        const req = p.request ?? {};
+        const inputHash = typeof req.inputHash === "string" ? req.inputHash : "";
+        if (this.now() - (p.requestedAt ?? 0) < TERMS_INSPECT_GRACE_MS) return j; // let an in-flight request settle
+        const found = (await gate.findPayments(inputHash)).filter((x) => x.metadata === req.metadata);
+        if (found.length > 1) throw new UncertainWriteError(`Task ${j.taskId}: ${found.length} MPS payments match the pending terms request; inspect MPS`);
+        if (found.length === 1) {
+          // It did apply: adopt the signed terms (re-read with history); they are validated as usual next.
+          const payment = await gate.resolve(found[0].blockchainIdentifier);
+          j.payment = { ...p, stage: "terms-saved", payment };
+          this.log(`Task ${j.taskId}: pending terms request found in MPS; adopted`);
+          return this.save(j);
+        }
+        // Inspection proved no payment exists: the request did not apply. Quote again with fresh deadlines.
+        delete j.payment;
+        this.log(`Task ${j.taskId}: pending terms request did not apply (not in MPS); re-quoting`);
+        this.save(j);
+        return this.advancePayment(j);
+      }
       case "terms-saved": {
         let payload: Record<string, unknown>;
         try {
@@ -486,6 +517,18 @@ export class TaskRunner {
       j.ledger.reimbursementAtomic = evidence.netAtomicUnits ?? null;
       j.ledger.settlementTx = evidence.txHash ?? null;
       j.ledger.marginMicro = (BigInt(evidence.netAtomicUnits ?? "0") - BigInt(j.ledger.treasuryNetOutMicro)).toString();
+      j.ledger.reimbursementEntry = {
+        kind: "float-reimbursement",
+        unit: TUSDM_UNIT,
+        atomic: evidence.netAtomicUnits ?? "0",
+        settlementTx: evidence.txHash ?? "",
+        sellerAddress: this.d.gate.seller().sellerAddress,
+        treasuryNetOutMicro: j.ledger.treasuryNetOutMicro,
+        marginMicro: j.ledger.marginMicro,
+        onChainTransferToTreasury: false,
+        recordedAt: this.now(),
+      };
+      this.log(`Task ${j.taskId} settled: seller net ${evidence.netAtomicUnits} tUSDM atomic (tx ${evidence.txHash}); reimbursement recorded against the float`);
     } else if (evidence.verified) p.stage = "settled";
     return this.save(j);
   }

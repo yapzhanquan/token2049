@@ -162,6 +162,9 @@ export interface GoalSummary {
   sessions?: number;
   running?: number;
   closed?: number;
+  /** Sessions still waiting for their funding tx (PLANNED / AWAITING_APPROVAL, e.g. a child spawn the treasury
+   * could not cover, or a self-custody signature that was never given). > 0 → the UI re-offers "Approve & start". */
+  awaitingFunding?: number;
 }
 
 export interface FundingPreview {

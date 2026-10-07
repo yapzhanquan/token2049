@@ -8,7 +8,7 @@ import { signOutAction } from "@/app/actions";
 import type { AgentCardDTO, GoalSummary, MeDTO, SessionDetailDTO } from "@bulkhead/shared";
 import { api, ConfigContext, LiveContext, useLive, useLiveStream, useResource, type AppConfig } from "@/lib/client";
 import { UNFUNDED_GOAL_TEXT, describeEvent, isGoalUnfunded } from "@/lib/describe";
-import { dateTimeOf, myr, timeOf } from "@/lib/money";
+import { dateTimeOf, myr, timeOf, TICKER } from "@/lib/money";
 import { WalletContext, type WalletState } from "@/lib/wallet-context";
 import { PlannedGoalBar } from "./PlannedGoalBar";
 import { ActivityLog } from "./ActivityLog";
@@ -91,7 +91,7 @@ function Workspace({ user }: { user: { name: string | null; email: string } }) {
   useEffect(() => {
     const q = new URLSearchParams(window.location.search);
     const t = q.get("topup");
-    if (t === "success") setNotice("Payment received by Stripe (test mode). The on-ramp sends tUSD + ADA to your treasury on preprod; the balance updates when the deposit confirms.");
+    if (t === "success") setNotice(`Payment received by Stripe (test mode). The on-ramp sends ${TICKER} + ADA to your treasury on preprod; the balance updates when the deposit confirms.`);
     if (t === "cancelled") setNotice("Top-up cancelled. Nothing was charged.");
     if (t) window.history.replaceState(null, "", "/");
   }, []);

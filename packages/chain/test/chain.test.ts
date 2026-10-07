@@ -24,7 +24,8 @@ describe("createChain", () => {
     const stores = sqliteStores(db);
     const provider = new FakeProvider();
     const chain = await createChain({ env: { MASTER_SECRET: TEST_MASTER, OPERATOR_MNEMONIC: TEST_MNEMONIC }, provider, mainnetProvider: null, stores });
-    expect(chain.tx.tusdUnit()).toMatch(/^[0-9a-f]{56}0014df1074555344$/);
+    expect(chain.tx.tusdUnit()).toBe(chain.settlement.unit); // default settlement = tUSDM (settlement.test.ts)
+    expect(chain.settlement.ticker).toBe("tUSDM");
     const t = await chain.keys.treasury("user-x", 4);
     const row = db.prepare("SELECT id, path, key_hash, ciphertext FROM keys WHERE id = ?").get("treasury:user-x") as Record<string, string>;
     expect(row.path).toBe("m/1852'/1815'/4'/0/0");

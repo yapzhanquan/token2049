@@ -82,6 +82,17 @@ export function describeEvent(e: BulkheadEvent, rate: string): { tone: Tone; tex
       return { tone: "warn", text: "Missed heartbeats (session went quiet)" };
     case "deadline_near":
       return { tone: "warn", text: "Deadline is near" };
+    case "session_looping":
+      return { tone: "warn", text: `Stuck in a loop (${s(d.failures)} failed calls${Array.isArray(d.recent) && d.recent.length ? `: ${s(d.recent[d.recent.length - 1])}` : ""}) · captain woken, escalation ${s(d.escalation)}` };
+    case "session_stalled":
+      return { tone: "warn", text: `No progress for ${Math.round(Number(d.idleMs ?? 0) / 60_000)} min · captain woken, escalation ${s(d.escalation)}` };
+    case "goal_completed":
+      return { tone: s(d.outcome) === "all_done" ? "good" : "warn", text: `Goal complete: ${s(d.doneMet)}/${s(d.total)} session(s) met their definition of done` };
+    case "captain_action": {
+      const input = (d.input ?? {}) as Record<string, unknown>;
+      const what = d.tool === "message_session" ? `message to session: ${s(input.text)}` : d.tool === "report_to_user" ? `report: ${s(input.text)}` : `${s(d.tool).replace(/_/g, " ")}${input.sessionId ? ` ${s(input.sessionId)}` : ""}`;
+      return { tone: d.ok === false ? "bad" : "msg", text: `Captain${d.auto ? " (auto)" : ""}: ${what}${d.ok === false ? ` — refused: ${s(d.error)}` : ""}` };
+    }
     case "error":
       return { tone: "bad", text: s(d.message ?? d.error ?? d.text ?? "error") };
     default:
@@ -109,9 +120,11 @@ export function sessionStatusWord(status: string | undefined, glyph?: string): s
   return (status ?? glyph ?? "").toLowerCase();
 }
 
-/** A goal whose plan was (or may be) approved but whose funding tx was never submitted. */
-export function isGoalUnfunded(goal: { status: string; fundingTx: string | null }): boolean {
-  return !goal.fundingTx && (goal.status === "planned" || goal.status === "approved");
+/** A goal whose plan was (or may be) approved but whose funding tx was never submitted — or a started goal with
+ * sessions still waiting for funding (Approve re-runs the funding; self-custody: the wallet signs again). */
+export function isGoalUnfunded(goal: { status: string; fundingTx: string | null; awaitingFunding?: number }): boolean {
+  if (!goal.fundingTx && (goal.status === "planned" || goal.status === "approved")) return true;
+  return (goal.status === "approved" || goal.status === "running") && (goal.awaitingFunding ?? 0) > 0;
 }
 
 export const UNFUNDED_GOAL_TEXT = "Plan not funded yet — approve or top up";

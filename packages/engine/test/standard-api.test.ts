@@ -205,6 +205,29 @@ describe("POST /start_job (paid)", () => {
     expect(s.engine.calls).toHaveLength(0); // no work before payment
   });
 
+  it("Dynamic pricing: the signed RequestedFunds (+ non-null sellerReturnAddress / forceLayer) are returned so a buyer can POST /purchase", async () => {
+    const s = setup();
+    const amounts = [{ unit: "16a55b2a349361ff88c03788f93e1e966e5d689605d044fef722ddde0014df10745553444d", amount: "2000000" }];
+    s.payments.quoteOverride = { amounts, sellerReturnAddress: "addr_test1qqreturn", paymentForceLayer: "L1" };
+    const body = await (await s.post("/start_job", startBody())).json();
+    expect(body).toMatchObject({ amounts, sellerReturnAddress: "addr_test1qqreturn", paymentForceLayer: "L1" });
+    // without them (fixed price, automatic routing) the keys are absent, not null
+    const t = setup();
+    const plain = await (await t.post("/start_job", startBody())).json();
+    expect(plain).not.toHaveProperty("amounts");
+    expect(plain).not.toHaveProperty("sellerReturnAddress");
+    expect(plain).not.toHaveProperty("paymentForceLayer");
+  });
+
+  it("MIP-003 shape (bundled masumi agentic-service-api.mdx): object input_data, id + job_id, int times, input_hash", async () => {
+    const s = setup();
+    const body = await (await s.post("/start_job", startBody())).json();
+    for (const k of ["id", "blockchainIdentifier", "payByTime", "submitResultTime", "unlockTime", "externalDisputeUnlockTime", "agentIdentifier", "sellerVKey", "identifierFromPurchaser", "input_hash"]) expect(body).toHaveProperty(k);
+    for (const k of ["payByTime", "submitResultTime", "unlockTime", "externalDisputeUnlockTime"]) expect(Number.isInteger(body[k])).toBe(true);
+    const st = await (await s.get(`/status?job_id=${body.id}`)).json();
+    expect(["awaiting_payment", "awaiting_input", "running", "completed", "failed"]).toContain(st.status);
+  });
+
   it("accepts the camelCase identifierFromPurchaser alias", async () => {
     const s = setup();
     const r = await s.post("/start_job", { identifierFromPurchaser: NONCE, input_data: { goal: "x" } });
@@ -456,6 +479,29 @@ describe("createMpsPayments (MPS routes, fake fetch)", () => {
     expect(seen[0]!.headers.token).toBe("test-token");
     expect(seen[0]!.body).toMatchObject({ network: "Preprod", agentIdentifier, inputHash: "e".repeat(64), identifierFromPurchaser: NONCE, supportedPaymentSourceIndex: 0, paymentSourceType: "Web3CardanoV2", submitResultTime: new Date(T0 + 60 * MIN).toISOString() });
     expect(q).toMatchObject({ blockchainIdentifier: "bc", sellerVKey: "d".repeat(56), payByTime: 1790000600000, submitResultTime: 1790003600000 });
+    expect(q).not.toHaveProperty("amounts"); // fixed price: no RequestedFunds in the response
+  });
+
+  it("parses RequestedFunds, sellerReturnAddress and forceLayer from the MPS payment response (payments/schemas.ts)", async () => {
+    const { mps } = client(() =>
+      ok({
+        blockchainIdentifier: "bc",
+        agentIdentifier,
+        inputHash: "e".repeat(64),
+        payByTime: "1790000600000",
+        submitResultTime: "1790003600000",
+        unlockTime: "1790004800000",
+        externalDisputeUnlockTime: "1790006000000",
+        RequestedFunds: [{ amount: "2000000", unit: "16a55b2a349361ff88c03788f93e1e966e5d689605d044fef722ddde0014df10745553444d" }],
+        sellerReturnAddress: "addr_test1qqreturn",
+        forceLayer: null,
+        SmartContractWallet: { walletVkey: "d".repeat(56) },
+        PaymentSource: { network: "Preprod", paymentSourceType: "Web3CardanoV2" },
+      }),
+    );
+    const q = await mps.createPaymentRequest({ inputHash: "e".repeat(64), identifierFromPurchaser: NONCE, payByTime: new Date(T0 + 10 * MIN), submitResultTime: new Date(T0 + 60 * MIN), unlockTime: new Date(T0 + 80 * MIN), externalDisputeUnlockTime: new Date(T0 + 100 * MIN) });
+    expect(q).toMatchObject({ amounts: [{ amount: "2000000", unit: "16a55b2a349361ff88c03788f93e1e966e5d689605d044fef722ddde0014df10745553444d" }], sellerReturnAddress: "addr_test1qqreturn" });
+    expect(q).not.toHaveProperty("paymentForceLayer");
   });
 
   it("rejects a non-Preprod payment source and reports HTTP errors as definite", async () => {

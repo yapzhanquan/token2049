@@ -207,6 +207,9 @@ export const EVENT_TYPES = [
   "captain_report", // report_to_user
   "user_message", // user → captain
   "deadline_near",
+  "session_stalled", // deterministic watchdog: a RUNNING session made no progress for too long
+  "session_looping", // deterministic watchdog: N consecutive failed / repeated tool calls
+  "goal_completed", // every session of the goal is CLOSED → the captain verifies + reports
   "error",
 ] as const;
 export type EventType = (typeof EVENT_TYPES)[number];
@@ -340,21 +343,27 @@ export type CaptainTool = (typeof CAPTAIN_TOOLS)[number];
 /** Event types that can wake the captain. Everything else is absorbed without an LLM call. */
 export const WAKE_EVENTS: readonly EventType[] = [
   "handback_submitted", // session finished
-  "session_transition", // only to FAILED | KILLED | EXPIRED | QUARANTINED | CLOSED (see isActionable)
+  "session_transition", // only to FAILED | KILLED | EXPIRED | QUARANTINED (see isActionable)
   "heartbeat_missed", // went quiet
+  "session_stalled", // no progress for too long (watchdog)
+  "session_looping", // repeated failed tool calls (watchdog)
   "decision_opened", // approval needed
-  "decision_closed",
+  "decision_closed", // only when rejected / expired (an approval is applied deterministically)
   "payment_rejected",
-  "tainted", // → quarantine
+  "tainted", // only when it quarantines the session (plain web reads are routine)
   "deposit_seen",
   "topup_confirmed",
   "deadline_near",
+  "goal_completed", // the whole crew is done → verify + final report
   "user_message",
 ];
 
 export function isActionable(e: Pick<BulkheadEvent, "type" | "data">): boolean {
   if (!WAKE_EVENTS.includes(e.type)) return false;
-  if (e.type === "session_transition") return ["FAILED", "KILLED", "EXPIRED", "QUARANTINED", "CLOSED"].includes(String(e.data.to));
+  const d = e.data ?? {};
+  if (e.type === "session_transition") return ["FAILED", "KILLED", "EXPIRED", "QUARANTINED"].includes(String(d.to));
+  if (e.type === "tainted") return d.quarantine === true;
+  if (e.type === "decision_closed") return d.status !== "approved";
   return true;
 }
 
@@ -493,6 +502,7 @@ export const ENGINE_ROUTES = {
 // Request bodies + response DTOs for the routes above.
 export * from "./api";
 export * from "./staking";
+export * from "./settlement";
 
 export const NETWORK = "preprod" as const;
 export const EXPLORER = "https://preprod.cardanoscan.io";

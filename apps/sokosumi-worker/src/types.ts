@@ -78,6 +78,8 @@ export interface PaidState {
   stage: PaymentStage;
   nonce: string;
   request?: Record<string, unknown>;
+  /** When the terms request was sent (terms-pending inspection waits a grace period after this). */
+  requestedAt?: number;
   /** Signed MPS payment terms, saved verbatim before validation. */
   payment?: MpsPayment;
   payload?: Record<string, unknown>;
@@ -119,6 +121,22 @@ export interface Ledger {
   settlementTx: string | null;
   /** reimbursement − treasuryNetOut (null until verified). */
   marginMicro: string | null;
+  /**
+   * Float ↔ reimbursement bridge entry, written once the settlement check verifies the seller's net
+   * receipt. Accounting only: the tUSDM stays in the MPS-managed Selling wallet (moved only through
+   * MPS-supported endpoints, never by extracting its keys); the entry credits it against the float.
+   */
+  reimbursementEntry?: {
+    kind: "float-reimbursement";
+    unit: string;
+    atomic: string;
+    settlementTx: string;
+    sellerAddress: string;
+    treasuryNetOutMicro: string;
+    marginMicro: string;
+    onChainTransferToTreasury: false;
+    recordedAt: number;
+  };
 }
 
 export interface TaskJournal {

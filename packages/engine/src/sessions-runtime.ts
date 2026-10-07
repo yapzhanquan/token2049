@@ -13,6 +13,7 @@ import { createSessionManager, type RuntimeSessionManager } from "./sessions";
 import { createSupervisor, type Supervisor } from "./supervisor";
 import { createOnRamp, type OnRamp } from "./onramp";
 import { runtimeConfig, type RuntimeConfig } from "./sessions-store";
+import { createGoalReconciler, type GoalReconciler } from "./goal-funding";
 
 export interface Runtime {
   config: RuntimeConfig;
@@ -24,6 +25,8 @@ export interface Runtime {
   sessions: RuntimeSessionManager;
   supervisor: Supervisor;
   onramp: OnRamp;
+  /** Approved/running goals with unfunded sessions: retried (custodial) or one exact shortfall notice. */
+  goalFunding: GoalReconciler;
   /** Boot: reconcile with the chain, then start the supervisor (call once after chain.watcher.start()). */
   boot(): Promise<void>;
   shutdown(): Promise<void>;
@@ -59,6 +62,7 @@ export function createRuntime(args: {
   });
   const supervisor = createSupervisor({ db, bus, chain, sessions, silos, config });
   const onramp = createOnRamp({ db, bus, chain, config });
+  const goalFunding = createGoalReconciler({ db, bus, chain, sessions, config });
   return {
     config,
     bus,
@@ -69,12 +73,17 @@ export function createRuntime(args: {
     sessions,
     supervisor,
     onramp,
+    goalFunding,
     async boot() {
       onramp.resume();
       await sessions.reconcile();
       supervisor.start();
+      goalFunding.start();
+      // First pass in the background: a stuck approved-but-unfunded goal is funded or reported right after boot.
+      void goalFunding.tick().catch((e) => bus.emit("error", { data: { kind: "goal_reconcile_failed", error: e instanceof Error ? e.message : String(e) } }));
     },
     async shutdown() {
+      goalFunding.stop();
       supervisor.stop();
       onramp.stop();
       await sessions.shutdown();

@@ -343,7 +343,7 @@ function requestApproval(input: Record<string, unknown>, ctx: CaptainToolContext
 }
 
 /** Execute one captain tool call, emitting `captain_action` either way. Never throws. */
-export async function runCaptainTool(name: string, input: Record<string, unknown>, ctx: CaptainToolContext): Promise<ToolOutcome> {
+export async function runCaptainTool(name: string, input: Record<string, unknown>, ctx: CaptainToolContext, opts: { auto?: boolean } = {}): Promise<ToolOutcome> {
   let outcome: ToolOutcome;
   try {
     outcome = { ok: true, result: await execute(name, input ?? {}, ctx) };
@@ -367,6 +367,8 @@ export async function runCaptainTool(name: string, input: Record<string, unknown
       ...(outcome.ok ? { result: truncateJson(outcome.result) } : { error: outcome.error }),
       userId: ctx.userId,
       triggerEventId: ctx.triggerEventId,
+      // auto: the deterministic helper made this move (the model did not act on an actionable signal).
+      ...(opts.auto ? { auto: true } : {}),
     },
   });
   return outcome;

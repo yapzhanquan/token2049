@@ -1,5 +1,9 @@
-// Display helpers shared by server and client. Amounts arrive as decimal strings of micro-tUSD.
-import { microToMyr, microToTusd } from "@bulkhead/shared";
+// Display helpers shared by server and client. Amounts arrive as decimal strings of micro-units of the
+// settlement asset (tUSDM by default; tUSD with SETTLEMENT_ASSET=tusd — see @bulkhead/shared settlement.ts).
+import { DEFAULT_SETTLEMENT_TICKER, microToMyr, microToTusd } from "@bulkhead/shared";
+
+/** Ticker of the settlement asset, inlined at build time by next.config.ts from SETTLEMENT_ASSET / SETTLEMENT_UNIT. */
+export const TICKER: string = process.env.NEXT_PUBLIC_SETTLEMENT_TICKER || DEFAULT_SETTLEMENT_TICKER;
 
 export const DEFAULT_MYR_PER_TUSD = "4.70";
 
@@ -24,7 +28,7 @@ export function myrShort(micro: string | bigint | null | undefined, rate = DEFAU
 export function tusd(micro: string | bigint | null | undefined): string {
   const s = microToTusd(big(micro));
   const [w, f = ""] = s.split(".");
-  return `${w}.${f.padEnd(2, "0").slice(0, Math.max(2, f.length))} tUSD`;
+  return `${w}.${f.padEnd(2, "0").slice(0, Math.max(2, f.length))} ${TICKER}`;
 }
 
 export function ada(lovelace: string | bigint | null | undefined): string {

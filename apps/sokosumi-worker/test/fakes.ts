@@ -232,6 +232,8 @@ export class FakeGate implements PaymentGate {
   calls: { op: string; arg?: unknown }[] = [];
   /** Mutate the next signed terms (e.g. to add a forceLayer). */
   tamper?: (p: MpsPayment) => void;
+  /** Next requestTerms throws this (after creating the payment when `applied`). */
+  failNext?: { error: Error; applied: boolean };
   readiness() {
     return this.ready ? { ready: true } : { ready: false, reason: "test: off" };
   }
@@ -243,6 +245,9 @@ export class FakeGate implements PaymentGate {
   }
   async requestTerms(r: TermsRequest): Promise<MpsPayment> {
     this.calls.push({ op: "terms", arg: r });
+    const fail = this.failNext;
+    this.failNext = undefined;
+    if (fail && !fail.applied) throw fail.error;
     const bi = `bi_${this.payments.size + 1}`;
     const p: MpsPayment = {
       blockchainIdentifier: bi,
@@ -261,10 +266,16 @@ export class FakeGate implements PaymentGate {
       SmartContractWallet: { id: SELLER.sellerWalletId, walletVkey: "v".repeat(56), walletAddress: SELLER.sellerAddress },
       CurrentTransaction: null,
       TransactionHistory: [],
+      metadata: r.metadata,
     };
     this.tamper?.(p);
     this.payments.set(bi, p);
+    if (fail) throw fail.error;
     return structuredClone(p);
+  }
+  async findPayments(inputHash: string) {
+    this.calls.push({ op: "find", arg: inputHash });
+    return [...this.payments.values()].filter((p) => p.inputHash === inputHash).map((p) => structuredClone(p));
   }
   async resolve(bi: string) {
     this.calls.push({ op: "resolve", arg: bi });
@@ -315,6 +326,8 @@ export interface Rig {
   clock: { t: number };
   runner: () => TaskRunner;
   logs: string[];
+  /** What the Blockfrost fetcher returns (null = not determinable). */
+  utxos: import("../src/settlement").TxUtxos | null;
 }
 
 /** A fresh runner over shared state; call `rig.runner()` again to simulate a process restart. */
@@ -334,6 +347,7 @@ export function makeRig(opts: { paid?: boolean; dir?: string } = {}): Rig {
     store: new JournalStore(dir),
     clock,
     logs,
+    utxos: null,
     runner: () =>
       new TaskRunner({
         soko,
@@ -342,7 +356,7 @@ export function makeRig(opts: { paid?: boolean; dir?: string } = {}): Rig {
         store: new JournalStore(dir),
         cfg: RUNNER_CFG,
         hashRule: RAW_UTF8_SHA256,
-        fetchUtxos: async () => null,
+        fetchUtxos: async () => rig.utxos,
         engineUserId: async () => engine.ensureUser("sokosumi-coworker@bulkhead.local"),
         now: () => clock.t,
         log: (m) => logs.push(m),

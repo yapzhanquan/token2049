@@ -60,6 +60,7 @@ import { toJsonSafe } from "./captain/tools";
 import { createStakingRoutes } from "./api-staking";
 import { createWalletRoutes } from "./api-wallet";
 import { createActivityRoutes } from "./api-activity";
+import { autoFundGoal, isDelegatedUser, startGoal } from "./goal-funding";
 
 /** The parts of the runtime OnRamp the API uses. */
 export type TopupService = Pick<OnRamp, "start" | "confirm" | "quote">;
@@ -79,6 +80,8 @@ export interface ApiDeps {
   chainLabel?: string;
   /** Live wake-filter counters (in-memory; the event log has the durable counts). */
   wakeStats?: () => { woken: number; absorbed: number };
+  /** AUTO_FUND_USER_EMAILS: custodial users whose POST /goals are funded at creation (delegated, mandate-bounded). */
+  autoFundUserEmails?: string[];
 }
 
 type Vars = { Variables: { userId: string } };
@@ -86,7 +89,7 @@ type Body = Record<string, unknown>;
 
 const RUNNING_GROUP: SessionStatus[] = ["RUNNING", "FUNDING", "COMPLETING"];
 const CLOSED_GROUP: SessionStatus[] = ["CLOSING", "CLOSED", ...ENDING_STATUSES];
-const PEEK: EventType[] = ["progress", "session_message", "mandate_change_ignored", "tool_denied", "web_fetch", "payment_rejected", "error"];
+const PEEK: EventType[] = ["progress", "session_message", "mandate_change_ignored", "tool_denied", "web_fetch", "payment_rejected", "error", "session_looping", "session_stalled", "captain_action"];
 
 export function createApi(deps: ApiDeps) {
   const { engine, signing } = deps;
@@ -360,13 +363,23 @@ export function createApi(deps: ApiDeps) {
   // ── goals ──
   app.post("/goals", async (c) => {
     const b = await readBody(c);
+    const userId = c.get("userId");
     const r = await captain.plan({
-      userId: c.get("userId"),
+      userId,
       goal: String(b.goal ?? ""),
       budgetTUSD: String(b.budgetTUSD ?? ""),
       deadline: String(b.deadline ?? ""),
       rules: typeof b.rules === "string" ? b.rules : "",
     });
+    // Delegated goals (API / Sokosumi worker / Masumi Standard API): fund at creation, inside the goal's mandate,
+    // with no UI click. Opt-in per request (`autoFund: true`) or per user (AUTO_FUND_USER_EMAILS). Self-custody
+    // users are never auto-funded (their wallet signs "Approve & start"). A later POST /goals/:id/approve is a no-op.
+    const user = userRow(userId);
+    const wantAuto = b.autoFund === true || b.delegated === true || isDelegatedUser({ autoFundUserEmails: deps.autoFundUserEmails }, user);
+    if (wantAuto && b.autoFund !== false && user.custody === "custodial") {
+      const autoFund = await autoFundGoal({ db, bus, sessions }, r.goalId);
+      return json(c, { ...r, autoFund }, 201);
+    }
     return json(c, r, 201);
   });
 
@@ -382,24 +395,21 @@ export function createApi(deps: ApiDeps) {
     const signed = typeof b.pendingId === "string" && typeof b.signedTx === "string";
     const existing = sessions.list({ goalId: g.id });
     const unfunded = existing.filter((s) => s.status === "PLANNED" || s.status === "AWAITING_APPROVAL");
-    const needsStart = g.status === "planned" || (existing.length === 0 && g.status === "approved") || (unfunded.length > 0 && unfunded.length === existing.length);
+    // Any session still waiting for its funding tx (a failed approve, a child spawn the treasury could not cover, a
+    // wallet signature that never came) is funded by approving again — startPlan only funds the unfunded ones.
+    const needsStart = g.status === "planned" || (existing.length === 0 && g.status === "approved") || (unfunded.length > 0 && (g.status === "approved" || g.status === "running"));
     if (!signed && !needsStart) return json(c, approvedState(true));
     const plan = PlanSchema.parse(JSON.parse(g.planJson));
     const start = async () => {
-      if (g.status === "planned") {
-        db.update(goals).set({ status: "approved" }).where(eq(goals.id, g.id)).run();
-        bus.emit("plan_approved", { goalId: g.id, data: { userId, sessions: plan.sessions.length } });
-      }
       try {
-        await sessions.startPlan(g.id, plan);
+        // planned → approved → startPlan (one funding tx) → running; shared with auto-funding + the goal reconciler.
+        await startGoal({ db, bus, sessions }, g.id);
       } catch (err) {
         bus.emit("error", { goalId: g.id, data: { where: "startPlan", message: (err as Error).message } });
         const e = err as Error & { code?: string };
         if (e.code === "insufficient_funds") throw e;
         throw httpError(502, `could not start the plan: ${e.message}`);
       }
-      const now = db.select({ status: goals.status }).from(goals).where(eq(goals.id, g.id)).get();
-      if (now?.status === "approved") db.update(goals).set({ status: "running" }).where(eq(goals.id, g.id)).run();
     };
     return signable(c, b, { goalId: g.id, purpose: `Fund ${plan.sessions.length} session wallet${plan.sessions.length === 1 ? "" : "s"} for "${clip(g.goal, 60)}"` }, start, () => approvedState(), () => approvedState());
   });
@@ -421,6 +431,7 @@ export function createApi(deps: ApiDeps) {
         sessions: ss.length,
         running: ss.filter((s) => RUNNING_GROUP.includes(s.status)).length,
         closed: ss.filter((s) => s.status === "CLOSED").length,
+        awaitingFunding: ss.filter((s) => s.status === "PLANNED" || s.status === "AWAITING_APPROVAL").length,
       };
     });
     return json(c, out);

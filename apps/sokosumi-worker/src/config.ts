@@ -11,6 +11,7 @@ export const PACKAGE_DIR = resolve(fileURLToPath(new URL("..", import.meta.url))
 export interface WorkerConfig {
   coworkerId: string;
   organizationId?: string;
+  organizationSlug?: string;
   engineUrl: string;
   engineToken: string;
   engineUserEmail: string;
@@ -41,10 +42,15 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): WorkerConfig {
   const feeMicro = tusd(env, "BULKHEAD_FEE_TUSDM", "0.5");
   const maxQuoteMicro = tusd(env, "MAX_QUOTE_TUSDM", "20");
   if (maxQuoteMicro <= feeMicro) throw new Error("MAX_QUOTE_TUSDM must exceed BULKHEAD_FEE_TUSDM");
-  const idx = env.MASUMI_PAYMENT_SOURCE_INDEX;
+  const idxRaw = env.MASUMI_PAYMENT_SOURCE_INDEX ?? env.MASUMI_SUPPORTED_PAYMENT_SOURCE_INDEX;
+  const idx = idxRaw?.trim();
+  if (idx !== undefined && idx !== "" && !/^\d+$/.test(idx)) throw new Error("MASUMI_PAYMENT_SOURCE_INDEX must be a non-negative integer");
+  const orgSlug = env.SOKOSUMI_ORGANIZATION_SLUG?.trim() || undefined;
+  if (orgSlug && !/^[a-z0-9][a-z0-9-]{0,62}$/.test(orgSlug)) throw new Error("SOKOSUMI_ORGANIZATION_SLUG is not a valid Workspace slug");
   return {
     coworkerId,
     organizationId: env.SOKOSUMI_ORGANIZATION_ID?.trim() || undefined,
+    organizationSlug: orgSlug,
     engineUrl: env.ENGINE_URL || "http://localhost:4000",
     engineToken,
     engineUserEmail: env.SOKOSUMI_ENGINE_USER_EMAIL || ENGINE_USER_EMAIL,

@@ -1,11 +1,11 @@
 "use client";
 // Top up RM50: Stripe Checkout (test mode) when configured, else a clearly labelled simulated
 // checkout. Both end at the engine's POST /topups/:id/confirm (idempotent by event id), which sends
-// REAL preprod tUSD + ADA from the operator wallet to the treasury.
+// REAL preprod settlement asset (tUSDM by default) + ADA from the operator wallet to the treasury.
 import { useState } from "react";
 import type { MeDTO, TopupStartResponse } from "@bulkhead/shared";
 import { api, useConfig } from "@/lib/client";
-import { ada, tusd } from "@/lib/money";
+import { ada, tusd, TICKER } from "@/lib/money";
 import { Modal } from "./Modal";
 
 export const ONRAMP_BANNER = "Testnet simulation: in production a licensed on-ramp provider converts fiat directly into your wallet.";
@@ -43,7 +43,7 @@ export function TopUpDialog({ me, onClose, onDone }: { me: MeDTO | null; onClose
   };
 
   return (
-    <Modal title={`Top up RM${amount}`} subtitle="Fiat → tUSD on Cardano preprod" onClose={onClose} width={480}>
+    <Modal title={`Top up RM${amount}`} subtitle={`Fiat → ${TICKER} on Cardano preprod`} onClose={onClose} width={480}>
       <div className="flex flex-col gap-3">
         <div className="banner banner-warn">
           <span>
@@ -63,10 +63,10 @@ export function TopUpDialog({ me, onClose, onDone }: { me: MeDTO | null; onClose
           <dt>Fee ({feePct}%)</dt>
           <dd>RM {fee.toFixed(2)}</dd>
           <dt>Rate</dt>
-          <dd>1 tUSD = RM {rate.toFixed(2)}</dd>
+          <dd>1 {TICKER} = RM {rate.toFixed(2)}</dd>
           <dt>You receive</dt>
           <dd>
-            ≈ {est.toFixed(2)} tUSD + 2 ADA (for fees / min-UTxO) at <span className="mono">{me ? `${me.treasuryAddress.slice(0, 18)}…` : "your treasury"}</span>
+            ≈ {est.toFixed(2)} {TICKER} + 2 ADA (for fees / min-UTxO) at <span className="mono">{me ? `${me.treasuryAddress.slice(0, 18)}…` : "your treasury"}</span>
           </dd>
           {me && (
             <>
@@ -88,7 +88,7 @@ export function TopUpDialog({ me, onClose, onDone }: { me: MeDTO | null; onClose
             </button>
             <div className="text-[12px] muted">
               Stripe is not configured (no STRIPE_SECRET_KEY), so no card is charged. The engine still runs the real on-ramp step: an operator
-              transfer of tUSD + ADA on preprod.
+              transfer of {TICKER} + ADA on preprod.
             </div>
           </>
         )}

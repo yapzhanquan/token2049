@@ -58,7 +58,14 @@ describe("funding preflight: precise top-up messages (never the raw Mesh error)"
     const err = await h.sessions.startPlan(goalId, plan).catch((e) => e);
     expect(err).toBeInstanceOf(FundingError);
     expect(err.code).toBe("insufficient_funds");
-    expect(err.message).toBe("Your treasury has 0 tUSD; this plan needs 8 tUSD (≈ RM37.60). Top up first.");
+    // Exact shortfall: asset (ticker + unit) + amount + where to send it.
+    const unit = h.chain.tx.tusdUnit();
+    expect(err.message).toBe(`Your treasury has 0 tUSD; this plan needs 8 tUSD (≈ RM37.60). Top up first. Shortfall: 8 tUSD (asset ${unit}) — send it to treasury ${h.treasury}.`);
+    expect(err.shortTusdMicro).toBe(8_000_000n);
+    expect(err.shortLovelace).toBe(0n);
+    expect(err.treasuryAddress).toBe(h.treasury);
+    const ev = h.events("error").find((e) => e.data.kind === "insufficient_funds")!;
+    expect(ev.data).toMatchObject({ shortTusdMicro: "8000000", treasuryAddress: h.treasury, assetUnit: unit });
     expect(h.chain.calls.fundSessions).toBe(0);
     expect(h.sessions.list({ goalId }).every((r) => r.status === "AWAITING_APPROVAL")).toBe(true);
   });

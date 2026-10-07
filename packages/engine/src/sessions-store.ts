@@ -46,7 +46,18 @@ export interface RuntimeConfig {
    * (on-chain enforcement). Self-custody users get vaults too: their wallet signs the unsigned vault funding (CIP-30),
    * falling back to "native" only when the chain cannot build unsigned vault funding (e.g. Koios). */
   walletMode: WalletMode;
+  /** SPAWN_BATCH_MS (default 300): child / hand-off spawns of one goal within this window share ONE top-up tx.
+   * 0 = fund each spawn on its own. */
+  spawnBatchMs?: number;
+  /** GOAL_RECONCILE_MS (default 60 s): how often approved/running goals with unfunded sessions are retried
+   * (custodial) or re-checked for an exact shortfall (self-custody). 0 = only at boot and on deposits. */
+  goalReconcileMs?: number;
+  /** AUTO_FUND_USER_EMAILS (comma list): custodial API users whose new goals are funded at creation (delegated,
+   * mandate-bounded; no UI click). Default: the Sokosumi worker + Masumi Standard API users. "none" = nobody. */
+  autoFundUserEmails?: string[];
 }
+
+export const DEFAULT_AUTO_FUND_USER_EMAILS = ["sokosumi-coworker@bulkhead.local", "masumi-standard@bulkhead.local"];
 
 export function runtimeConfig(overrides: Partial<RuntimeConfig> = {}): RuntimeConfig {
   const env = process.env;
@@ -86,6 +97,16 @@ export function runtimeConfig(overrides: Partial<RuntimeConfig> = {}): RuntimeCo
     })(),
     marketUrl,
     walletMode: env.WALLET_MODE?.trim().toLowerCase() === "native" ? "native" : "vault",
+    spawnBatchMs: Math.max(0, Number(env.SPAWN_BATCH_MS ?? 300) || 0),
+    goalReconcileMs: Math.max(0, Number(env.GOAL_RECONCILE_MS ?? 60_000) || 0),
+    autoFundUserEmails: (() => {
+      const raw = env.AUTO_FUND_USER_EMAILS?.trim();
+      if (raw === undefined || raw === "") {
+        return [...DEFAULT_AUTO_FUND_USER_EMAILS, env.STANDARD_API_ENGINE_USER_EMAIL, env.SOKOSUMI_ENGINE_USER_EMAIL].filter((e): e is string => !!e).map((e) => e.toLowerCase());
+      }
+      if (raw.toLowerCase() === "none") return [];
+      return raw.split(",").map((e) => e.trim().toLowerCase()).filter(Boolean);
+    })(),
     ...overrides,
   };
 }

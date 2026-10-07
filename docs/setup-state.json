@@ -89,5 +89,71 @@
       "scope": "ReadAndPay (canRead+canPay, canAdmin false), usageLimited false, Preprod only, wallet scope = Purchasing wallet cmuxiwa790008owvc4fqcegab",
       "verified": "verified (api-key-status + payment-source list, HTTP 200)"
     }
+  },
+  "sokosumiE2E": {
+    "at": "2026-10-07T04:02Z",
+    "doc": "docs/e2e-sokosumi.md",
+    "cli": "1.0.0: tasks commands use --organization-slug bulkhead-3qb9jz; runtime uses --organization-id (VERIFIED from CLI source + live run)",
+    "workerEnv": "apps/sokosumi-worker/.env (gitignored, non-secret values; PAID_TASKS_ENABLED=true, PAY_BY_MINUTES=20)",
+    "standardApi": "VERIFIED listening 127.0.0.1:4200 (paid mode, MPS Preprod)",
+    "engineUser": {
+      "email": "sokosumi-coworker@bulkhead.local",
+      "id": "u_4ff72b9a-a8a6-4828-b243-84d44b5d9a36",
+      "custody": "custodial",
+      "treasuryAddress": "addr_test1qrw53vhedgt07xr8sv84sw05u0zfw6lcd0vu7q3mdyk5zxe3r7n72nj7w6yc3pefqjs86k2eke33app7yersgs8rqxts4zzkgp",
+      "topupTx": "a12118dd070887e72a85ee377c7b99bec18ba053153b1baa3a9b501900655d78",
+      "balanceAfterTopup": "10478723 tUSD micro + 25000000 lovelace (VERIFIED GET /me)"
+    },
+    "executionOnlyTask": {
+      "id": "01a1147a-0470-7263-b5ee-ef1c0f8cfead",
+      "status": "COMPLETED (VERIFIED)",
+      "runningEventId": "01a1147a-0c10-7389-a601-fc5948c8b636",
+      "completedEventId": "01a1147c-edd5-704f-ae83-11911ee8fce7",
+      "goalId": "g_844d6715-6b57-481b-aec6-555fcb56cc37",
+      "sessions": [
+        "ses_de6206b2d6a04271",
+        "ses_dacd28003c434aaf"
+      ],
+      "fundingTx": "6306803c40b6e88eeef9a1c8f6a338cf0bf22464d1f9594dc9b63da731cf5093",
+      "closeTxs": [
+        "8a082af329d19941c352529342d8d026f00e9ed7282bb363e06cf2562b25e9ce",
+        "1545cceebecdaa935c89731ddf0dc1908848b8b44fce66c8917787b48d404d17"
+      ],
+      "resultSha256RawUtf8": "062e0dc760c50700def92f922383d7ce75d19aaa60bfc15206e0a60932ecae44",
+      "humanComment": {
+        "userEventId": "01a11484-c59b-7031-b2df-43059eb8bcd2",
+        "coworkerReplyEventId": "01a11484-cff2-71d7-a471-14def27833ec",
+        "intent": "captain (VERIFIED forwarded + replied)"
+      }
+    },
+    "paidTask": {
+      "id": "01a1147d-df7e-71db-9aad-2a3d5fb3e1fe",
+      "status": "BLOCKED: MPS POST /payment HTTP 400 sellerReturnAddress (VERIFIED); nothing created (VERIFIED); worker failure comment 01a11484-4218-7769-992b-8fb45b87d345",
+      "fixNeeded": "PATCH /api/v1/wallet {id: cmuxiwa790009owvcaofhehg1, newCollectionAddress: null} with the MPS admin key; then create a new paid Task"
+    }
+  },
+  "masumiBuyer": {
+    "at": "2026-10-07",
+    "code": "packages/engine/src/market-masumi.ts (MARKET=masumi), smoke packages/engine/scripts/masumi-hire-smoke.ts",
+    "mps": "http://127.0.0.1:3901 (buyer key cmuxjl8ed0005v4vcxrhqbopd, file .local/mps-buyer.env, never printed)",
+    "keyScope": "VERIFIED GET /api-key-status: ReadAndPay, canAdmin false, Preprod only, wallet scope = purchasing wallet cmuxiwa790008owvc4fqcegab",
+    "purchasingWallet": {
+      "id": "cmuxiwa790008owvc4fqcegab",
+      "address": "addr_test1qr0rnnrhe6tlj5cls2xcunaxvl8kgaa6henck5hjd2fvpw073tfdyz2574tg4rnazrw23t2klnd3ldlx22zdf75y7cnqpcvlyj",
+      "collectionAddress": "\"\" (empty; the market always sends buyerReturnAddress = this wallet)",
+      "balance": "UNFUNDED: Blockfrost HTTP 404 + MPS GET /utxos 404 'Address not found' (2026-10-07)"
+    },
+    "fundingNeededForSmokeBuy": {
+      "tADA": "at least 20 (suggested 25): escrow min-UTxO + 5 ADA collateral splitter + fees",
+      "tUSDM": "at least the agent price (suggested 2)",
+      "tUSDMUnit": "16a55b2a349361ff88c03788f93e1e966e5d689605d044fef722ddde0014df10745553444d (VERIFIED in MPS frontend/src/lib/constants/defaultWallets.ts PREPROD_USDM_CONFIG)"
+    },
+    "paymentSource": "VERIFIED GET /payment-source: Preprod Web3CardanoV2, policy 67ab0c92c4ac1610895a1c965ee50aba41a8f1513b15240723b3bd0b, contract addr_test1wzs4e6wc95hkwezlccjw9mdvq0r0rsgx6zk34avptga3ftgn37w4g",
+    "discovery": "VERIFIED: MPS GET /registry is wallet-scoped and EMPTY for the buyer key; on-chain registry (Blockfrost policy 67ab0c92…) has 93 live agent NFTs, smoke preflight lists 27 hireable / 73 excluded",
+    "purchaseShapes": "VERIFIED against MPS source (purchases/schemas.ts, index.ts, shared.ts); POST /purchase not yet executed live",
+    "thirdPartyStartJob": "INFERRED/REPORTED (bundled MIP-003 doc); no third-party start_job called",
+    "smokePreflight": "VERIFIED read-only run: health ok, key ok, balance unfunded, picked 'Hotel book expert' (1 tUSDM, availability ok)",
+    "purchase": "NOT EXERCISED (wallet unfunded)",
+    "standardApi": "VERIFIED live 127.0.0.1:4200 read-only/4xx checks match MIP-003; fix (start_job returns Dynamic amounts / sellerReturnAddress / paymentForceLayer) needs a restart of the running process"
   }
 }

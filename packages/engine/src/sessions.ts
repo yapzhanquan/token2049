@@ -53,6 +53,11 @@ export interface RuntimeSessionManager extends SessionManager {
   onFundingConfirmed(txHash: string): Promise<void>;
   /** Start queued sessions while slots are free (MAX_PARALLEL_SESSIONS). */
   drainQueue(): Promise<void>;
+  /** Fund every session of the goal that has no funding tx yet (one treasury tx); returns the ids it funded.
+   * Throws FundingError (exact shortfall) when the treasury cannot cover them. Used by the goal reconciler. */
+  fundUnfunded(goalId: string): Promise<string[]>;
+  /** True while a funding tx for one of the goal's sessions is in flight (or a spawn batch is pending). */
+  isFunding(goalId: string): boolean;
   /** Store a submitted handback and move RUNNING → COMPLETING (SiloRunner calls this after validation). */
   acceptSubmission(sessionId: string, handback: Handback): Promise<void>;
   /** Mark a session tainted; quarantine + open a quarantine_release decision when `quarantine`. */
@@ -96,9 +101,42 @@ export class FundingError extends Error {
     readonly needTusdMicro: bigint,
     readonly haveLovelace?: bigint,
     readonly haveTusdMicro?: bigint,
+    /** Exact shortfall (need − have, ≥ 0) per asset; undefined when that balance is unknown. */
+    readonly shortLovelace?: bigint,
+    readonly shortTusdMicro?: bigint,
+    /** Where to send the missing funds, and the settlement asset's unit (policy id + asset name hex). */
+    readonly treasuryAddress?: string,
+    readonly assetUnit?: string,
   ) {
     super(message);
     this.name = "FundingError";
+  }
+  /** Structured fields for `error` events (bigints as strings). */
+  details(): Record<string, string | undefined> {
+    return {
+      needLovelace: this.needLovelace.toString(),
+      needTusdMicro: this.needTusdMicro.toString(),
+      haveLovelace: this.haveLovelace?.toString(),
+      haveTusdMicro: this.haveTusdMicro?.toString(),
+      shortLovelace: this.shortLovelace?.toString(),
+      shortTusdMicro: this.shortTusdMicro?.toString(),
+      treasuryAddress: this.treasuryAddress,
+      assetUnit: this.assetUnit,
+    };
+  }
+}
+
+/** Display ticker of the settlement asset, read from its unit (CIP-68 333 content or a plain asset name), so it
+ * follows whatever asset the chain layer is configured with. Falls back to "tUSD". */
+export function assetLabelFromUnit(unit?: string): string {
+  if (!unit || unit.length <= 56) return "tUSD";
+  let hex = unit.slice(56).toLowerCase();
+  if (/^0014df10/.test(hex)) hex = hex.slice(8); // CIP-67 label 333 (fungible token)
+  try {
+    const s = Buffer.from(hex, "hex").toString("utf8");
+    return /^[\x21-\x7e]{1,32}$/.test(s) ? s : "tUSD";
+  } catch {
+    return "tUSD";
   }
 }
 
@@ -126,16 +164,42 @@ const rm = (micro: bigint, myrPerTusd: string) => `RM${((Number(micro) / 1_000_0
  * `force`: the chain already said the balance is insufficient (coin selection failed) — always return an error,
  * worded with whatever balances are known.
  */
-export function fundingShortfall(a: { haveLovelace?: bigint; haveTusdMicro?: bigint; needLovelace: bigint; needTusdMicro: bigint; myrPerTusd: string; force?: boolean }): FundingError | null {
+export function fundingShortfall(a: {
+  haveLovelace?: bigint;
+  haveTusdMicro?: bigint;
+  needLovelace: bigint;
+  needTusdMicro: bigint;
+  myrPerTusd: string;
+  force?: boolean;
+  /** When given, the message ends with the exact shortfall per asset and where to send it. */
+  treasuryAddress?: string;
+  assetUnit?: string;
+}): FundingError | null {
   const parts: string[] = [];
   const tusdShort = a.haveTusdMicro !== undefined && a.haveTusdMicro < a.needTusdMicro;
   const adaShort = a.haveLovelace !== undefined && a.haveLovelace < a.needLovelace;
-  if (tusdShort) parts.push(`Your treasury has ${microToTusd(a.haveTusdMicro!)} tUSD; this plan needs ${microToTusd(a.needTusdMicro)} tUSD (≈ ${rm(a.needTusdMicro, a.myrPerTusd)}). Top up first.`);
+  const shortTusdMicro = a.haveTusdMicro !== undefined ? (tusdShort ? a.needTusdMicro - a.haveTusdMicro : 0n) : undefined;
+  const shortLovelace = a.haveLovelace !== undefined ? (adaShort ? a.needLovelace - a.haveLovelace : 0n) : undefined;
+  const make = (msg: string) => {
+    let m = msg;
+    if (a.treasuryAddress) {
+      const label = assetLabelFromUnit(a.assetUnit);
+      const owed: string[] = [];
+      if (tusdShort) owed.push(`${microToTusd(shortTusdMicro!)} ${label}${a.assetUnit ? ` (asset ${a.assetUnit})` : ""}`);
+      if (adaShort) owed.push(`${ada(shortLovelace!)} tADA`);
+      m += owed.length
+        ? ` Shortfall: ${owed.join(" + ")} — send it to treasury ${a.treasuryAddress}.`
+        : ` Treasury: ${a.treasuryAddress}${a.assetUnit ? ` (asset ${a.assetUnit})` : ""}.`;
+    }
+    return new FundingError(m, a.needLovelace, a.needTusdMicro, a.haveLovelace, a.haveTusdMicro, shortLovelace, shortTusdMicro, a.treasuryAddress, a.assetUnit);
+  };
+  const tk = assetLabelFromUnit(a.assetUnit); // settlement ticker (tUSDM by default)
+  if (tusdShort) parts.push(`Your treasury has ${microToTusd(a.haveTusdMicro!)} ${tk}; this plan needs ${microToTusd(a.needTusdMicro)} ${tk} (≈ ${rm(a.needTusdMicro, a.myrPerTusd)}). Top up first.`);
   if (adaShort)
     parts.push(`Your treasury has ${ada(a.haveLovelace!)} tADA; this plan needs ≈ ${ada(a.needLovelace)} tADA (min-ADA + fee headroom for each session wallet + the network fee). Add tADA from the preprod faucet first.`);
   if (!parts.length && a.force)
-    parts.push(`Your treasury cannot cover this plan: it needs ${microToTusd(a.needTusdMicro)} tUSD (≈ ${rm(a.needTusdMicro, a.myrPerTusd)}) and ≈ ${ada(a.needLovelace)} tADA${a.haveTusdMicro !== undefined ? ` (has ${microToTusd(a.haveTusdMicro)} tUSD, ${ada(a.haveLovelace ?? 0n)} tADA)` : ""}. Top up first.`);
-  return parts.length ? new FundingError(parts.join(" "), a.needLovelace, a.needTusdMicro, a.haveLovelace, a.haveTusdMicro) : null;
+    parts.push(`Your treasury cannot cover this plan: it needs ${microToTusd(a.needTusdMicro)} ${tk} (≈ ${rm(a.needTusdMicro, a.myrPerTusd)}) and ≈ ${ada(a.needLovelace)} tADA${a.haveTusdMicro !== undefined ? ` (has ${microToTusd(a.haveTusdMicro)} ${tk}, ${ada(a.haveLovelace ?? 0n)} tADA)` : ""}. Top up first.`);
+  return parts.length ? make(parts.join(" ")) : null;
 }
 
 /** Mesh / CSL coin-selection and ledger "not enough value" errors (mapped to FundingError, never shown raw). */
@@ -188,6 +252,9 @@ export function createSessionManager(deps: SessionManagerDeps): RuntimeSessionMa
   const closedWaiters = new Map<string, (() => void)[]>();
   let stopped = false;
   const queuedNoticed = new Set<string>();
+  /** Sessions whose funding tx is being built / signed / submitted right now (never funded twice concurrently). */
+  const fundingNow = new Set<string>();
+  const watchingFunding = new Set<string>();
 
   const must = (id: string): SessionDbRow => {
     const r = getSessionDb(db, id);
@@ -204,6 +271,15 @@ export function createSessionManager(deps: SessionManagerDeps): RuntimeSessionMa
     p.catch((e) => {
       if (!stopped) bus.emit("error", { sessionId, goalId: sessionId ? getSessionDb(db, sessionId)?.goalId : undefined, data: { kind: what, error: err(e) } });
     });
+
+  /** The settlement asset's unit (for shortfall messages); undefined when the chain cannot tell. */
+  const tusdUnitOrUndefined = (): string | undefined => {
+    try {
+      return chain.tx.tusdUnit();
+    } catch {
+      return undefined;
+    }
+  };
 
   // ─────────── Session Vault helpers (walletMode "vault") ───────────
   /** ada_allowance from live protocol params (see adaAllowanceFrom); 3 tADA when params are unavailable. */
@@ -310,7 +386,13 @@ export function createSessionManager(deps: SessionManagerDeps): RuntimeSessionMa
     db.insert(transitions).values({ sessionId: id, from, to, reason, at: now() }).run();
   }
 
-  async function createSessionRows(goalId: string, items: { spec: PlannedSession; parentSessionId: string | null; contextFrom: string[] }[]): Promise<string[]> {
+  /** Row creation is serialised engine-wide: letters (per goal) and BIP32 key indexes (global) are allocated from
+   * the current max, so parallel spawns must not interleave. */
+  function createSessionRows(goalId: string, items: { spec: PlannedSession; parentSessionId: string | null; contextFrom: string[] }[]): Promise<string[]> {
+    return lock("__create_rows__", () => createSessionRowsLocked(goalId, items));
+  }
+
+  async function createSessionRowsLocked(goalId: string, items: { spec: PlannedSession; parentSessionId: string | null; contextFrom: string[] }[]): Promise<string[]> {
     const goal = db.select().from(goals).where(eq(goals.id, goalId)).get();
     if (!goal) throw new Error(`goal ${goalId} not found`);
     const user = userOf(goal.userId);
@@ -400,12 +482,84 @@ export function createSessionManager(deps: SessionManagerDeps): RuntimeSessionMa
    * if the preflight or the tx fails they STAY there, so re-approving (startPlan again) resumes cleanly.
    */
   async function fund(goalId: string, ids: string[]): Promise<void> {
-    for (const id of ids) await mgr.transition(id, "AWAITING_APPROVAL", "awaiting plan approval");
-    // One treasury tx per wallet mode (normally all sessions of a plan share one mode → ONE tx).
-    for (const mode of ["native", "vault"] as const) {
-      const group = ids.filter((id) => (must(id).walletMode ?? "native") === mode);
-      if (group.length) await fundGroup(goalId, group, mode);
+    const mine = ids.filter((id) => !fundingNow.has(id));
+    for (const id of mine) fundingNow.add(id);
+    try {
+      for (const id of mine) await mgr.transition(id, "AWAITING_APPROVAL", "awaiting plan approval");
+      // One treasury tx per wallet mode (normally all sessions of a plan share one mode → ONE tx).
+      for (const mode of ["native", "vault"] as const) {
+        const group = mine.filter((id) => (must(id).walletMode ?? "native") === mode);
+        if (group.length) await fundGroup(goalId, group, mode);
+      }
+    } finally {
+      for (const id of mine) fundingNow.delete(id);
     }
+  }
+
+  /**
+   * Sessions of a goal that still need a funding tx: no fundingTx, PLANNED / AWAITING_APPROVAL, and not being funded
+   * right now. A wallet the chain shows as already funded (crash between submit and DB write) moves to FUNDING
+   * instead of being funded twice.
+   */
+  async function unfundedOf(goalId: string): Promise<string[]> {
+    const rows = db.select().from(sessions).where(eq(sessions.goalId, goalId)).orderBy(asc(sessions.createdAt), asc(sessions.letter)).all();
+    const out: string[] = [];
+    for (const r of rows) {
+      if (r.fundingTx) {
+        // Already submitted: make sure its confirmation is tracked (never fund again).
+        const tx = r.fundingTx;
+        if (r.status === "FUNDING" && !r.fundingConfirmedAt && !watchingFunding.has(tx)) {
+          watchingFunding.add(tx);
+          void background(
+            waitForTx(chain, tx, { timeoutMs: config.txConfirmTimeoutMs, pollMs: config.txPollMs })
+              .then((ok) => (ok ? mgr.onFundingConfirmed(tx) : undefined))
+              .finally(() => watchingFunding.delete(tx)),
+            "funding_wait",
+          );
+        }
+        continue;
+      }
+      if (r.status !== "PLANNED" && r.status !== "AWAITING_APPROVAL") continue;
+      if (fundingNow.has(r.id)) continue;
+      const bal = r.address ? await chain.tx.balanceOf(r.address).catch(() => null) : null;
+      if (bal && (bal.tusdMicro > 0n || bal.utxoCount > 0)) {
+        await mgr.transition(r.id, "AWAITING_APPROVAL", "resume");
+        updateSessionDb(db, r.id, { fundingConfirmedAt: now() }, now());
+        await mgr.transition(r.id, "FUNDING", "funding found on-chain (resumed)");
+        continue;
+      }
+      out.push(r.id);
+    }
+    return out;
+  }
+
+  // ─────────── child / hand-off spawns: batched top-ups ───────────
+  /** Spawns of one goal that arrive within spawnBatchMs share ONE treasury funding tx (TreasuryQueue serialises it
+   * against every other spend of the treasury). Each spawn() resolves / rejects with its batch. */
+  type Waiter = { resolve: () => void; reject: (e: unknown) => void };
+  const spawnBatches = new Map<string, { ids: string[]; waiters: Waiter[]; timer: ReturnType<typeof setTimeout> }>();
+  function fundBatched(goalId: string, id: string): Promise<void> {
+    const wait = config.spawnBatchMs ?? 0;
+    if (wait <= 0) return fund(goalId, [id]);
+    return new Promise<void>((resolve, reject) => {
+      let b = spawnBatches.get(goalId);
+      if (!b) {
+        b = { ids: [], waiters: [], timer: setTimeout(() => flush(goalId), wait) };
+        spawnBatches.set(goalId, b);
+      }
+      b.ids.push(id);
+      b.waiters.push({ resolve, reject });
+    });
+  }
+  function flush(goalId: string) {
+    const b = spawnBatches.get(goalId);
+    if (!b) return;
+    spawnBatches.delete(goalId);
+    clearTimeout(b.timer);
+    fund(goalId, b.ids).then(
+      () => b.waiters.forEach((w) => w.resolve()),
+      (e) => b.waiters.forEach((w) => w.reject(e)),
+    );
   }
 
   async function fundGroup(goalId: string, ids: string[], mode: WalletMode): Promise<void> {
@@ -420,9 +574,10 @@ export function createSessionManager(deps: SessionManagerDeps): RuntimeSessionMa
     const user = userOf(goal.userId);
     const need = fundingNeed(outputs);
     const shortfall = (e: FundingError) => {
-      bus.emit("error", { goalId, data: { kind: "insufficient_funds", error: e.message, needLovelace: e.needLovelace.toString(), needTusdMicro: e.needTusdMicro.toString(), haveLovelace: e.haveLovelace?.toString(), haveTusdMicro: e.haveTusdMicro?.toString(), sessionIds: ids } });
+      bus.emit("error", { goalId, data: { kind: "insufficient_funds", error: e.message, ...e.details(), sessionIds: ids } });
       return e;
     };
+    const where = { treasuryAddress: user.treasuryAddress, assetUnit: tusdUnitOrUndefined() };
     let bal: { lovelace: bigint; tusdMicro: bigint } | null = null;
     try {
       bal = await chain.tx.balanceOf(user.treasuryAddress);
@@ -430,19 +585,19 @@ export function createSessionManager(deps: SessionManagerDeps): RuntimeSessionMa
       bal = null; // balance unavailable → the build below decides; balance errors are still mapped
     }
     if (bal) {
-      const e = fundingShortfall({ haveLovelace: bal.lovelace, haveTusdMicro: bal.tusdMicro, needLovelace: need.lovelace, needTusdMicro: need.tusdMicro, myrPerTusd: config.myrPerTusd });
+      const e = fundingShortfall({ haveLovelace: bal.lovelace, haveTusdMicro: bal.tusdMicro, needLovelace: need.lovelace, needTusdMicro: need.tusdMicro, myrPerTusd: config.myrPerTusd, ...where });
       if (e) throw shortfall(e);
     }
     let preview: Awaited<ReturnType<Chain["tx"]["previewFunding"]>> | null = null;
     try {
       preview = vault?.preview ? await vault.preview({ userId: goal.userId, outputs }) : await chain.tx.previewFunding({ userId: goal.userId, outputs });
     } catch (e) {
-      if (isBalanceError(e)) throw shortfall(fundingShortfall({ haveLovelace: bal?.lovelace, haveTusdMicro: bal?.tusdMicro, needLovelace: need.lovelace, needTusdMicro: need.tusdMicro, myrPerTusd: config.myrPerTusd, force: true })!);
+      if (isBalanceError(e)) throw shortfall(fundingShortfall({ haveLovelace: bal?.lovelace, haveTusdMicro: bal?.tusdMicro, needLovelace: need.lovelace, needTusdMicro: need.tusdMicro, myrPerTusd: config.myrPerTusd, ...where, force: true })!);
       preview = null; // preview unavailable -> the funding call reports its own error
     }
     if (preview && bal) {
       // The exact totals from the built tx (real min-ADA + fee) refine the estimate.
-      const e = fundingShortfall({ haveLovelace: bal.lovelace, haveTusdMicro: bal.tusdMicro, needLovelace: preview.totalLovelace, needTusdMicro: preview.totalTusdMicro, myrPerTusd: config.myrPerTusd });
+      const e = fundingShortfall({ haveLovelace: bal.lovelace, haveTusdMicro: bal.tusdMicro, needLovelace: preview.totalLovelace, needTusdMicro: preview.totalTusdMicro, myrPerTusd: config.myrPerTusd, ...where });
       if (e) throw shortfall(e);
     }
     let res;
@@ -452,7 +607,7 @@ export function createSessionManager(deps: SessionManagerDeps): RuntimeSessionMa
       res = vault ? await vault.fund(args) : await chain.tx.fundSessions(args);
     } catch (e) {
       if (isBalanceError(e)) {
-        throw shortfall(fundingShortfall({ haveLovelace: bal?.lovelace, haveTusdMicro: bal?.tusdMicro, needLovelace: preview?.totalLovelace ?? need.lovelace, needTusdMicro: need.tusdMicro, myrPerTusd: config.myrPerTusd, force: true })!);
+        throw shortfall(fundingShortfall({ haveLovelace: bal?.lovelace, haveTusdMicro: bal?.tusdMicro, needLovelace: preview?.totalLovelace ?? need.lovelace, needTusdMicro: need.tusdMicro, myrPerTusd: config.myrPerTusd, ...where, force: true })!);
       }
       bus.emit("error", { goalId, data: { kind: "funding_failed", error: err(e), sessionIds: ids, note: "sessions stay AWAITING_APPROVAL; approving again retries" } });
       throw e;
@@ -648,30 +803,8 @@ export function createSessionManager(deps: SessionManagerDeps): RuntimeSessionMa
       // Idempotent / resumable: a goal that already has session rows is resumed, never re-created or double-funded.
       const prior = db.select().from(sessions).where(eq(sessions.goalId, goalId)).orderBy(asc(sessions.createdAt), asc(sessions.letter)).all();
       if (prior.length) {
-        const unfunded: string[] = [];
-        for (const r of prior) {
-          if (r.fundingTx) {
-            // Already submitted: make sure its confirmation is tracked (never fund again).
-            const tx = r.fundingTx;
-            if (r.status === "FUNDING" && !r.fundingConfirmedAt) {
-              void background(
-                waitForTx(chain, tx, { timeoutMs: config.txConfirmTimeoutMs, pollMs: config.txPollMs }).then((ok) => (ok ? mgr.onFundingConfirmed(tx) : undefined)),
-                "funding_wait",
-              );
-            }
-            continue;
-          }
-          if (r.status !== "PLANNED" && r.status !== "AWAITING_APPROVAL") continue;
-          // Crash between submit and DB write? The chain is the truth: a funded address is not funded again.
-          const bal = r.address ? await chain.tx.balanceOf(r.address).catch(() => null) : null;
-          if (bal && (bal.tusdMicro > 0n || bal.utxoCount > 0)) {
-            await mgr.transition(r.id, "AWAITING_APPROVAL", "resume");
-            updateSessionDb(db, r.id, { fundingConfirmedAt: now() }, now());
-            await mgr.transition(r.id, "FUNDING", "funding found on-chain (resumed)");
-            continue;
-          }
-          unfunded.push(r.id);
-        }
+        // Crash between submit and DB write? The chain is the truth: a funded address is not funded again.
+        const unfunded = await unfundedOf(goalId);
         bus.emit("plan_approved", { goalId, data: { sessionIds: prior.map((r) => r.id), resumed: true, refunding: unfunded } });
         if (unfunded.length) await fund(goalId, unfunded);
         await mgr.drainQueue();
@@ -692,9 +825,40 @@ export function createSessionManager(deps: SessionManagerDeps): RuntimeSessionMa
       return ids;
     },
     async spawn(goalId, spec, opts = {}) {
+      // A child / hand-off session gets its OWN wallet (vault) funded before it can start: drainQueue only starts
+      // FUNDING sessions whose funding tx is confirmed. Spawns close together share one top-up tx.
       const [id] = await createSessionRows(goalId, [{ spec, parentSessionId: opts.parentSessionId ?? null, contextFrom: opts.contextFrom ?? [] }]);
-      await fund(goalId, [id!]);
+      try {
+        await fundBatched(goalId, id!);
+      } catch (e) {
+        if (e instanceof FundingError) {
+          const letter = getSessionDb(db, id!)?.letter ?? id;
+          // The session exists and waits in AWAITING_APPROVAL; the goal reconciler funds it once the treasury can.
+          throw new FundingError(
+            `Session ${letter} (${id}) was created but not funded: ${e.message} It starts automatically once the treasury is topped up — do not spawn it again.`,
+            e.needLovelace,
+            e.needTusdMicro,
+            e.haveLovelace,
+            e.haveTusdMicro,
+            e.shortLovelace,
+            e.shortTusdMicro,
+            e.treasuryAddress,
+            e.assetUnit,
+          );
+        }
+        throw e;
+      }
       return id!;
+    },
+    async fundUnfunded(goalId) {
+      const unfunded = await unfundedOf(goalId);
+      if (unfunded.length) await fund(goalId, unfunded);
+      await mgr.drainQueue();
+      return unfunded;
+    },
+    isFunding(goalId) {
+      for (const id of fundingNow) if (getSessionDb(db, id)?.goalId === goalId) return true;
+      return spawnBatches.has(goalId);
     },
     get(id) {
       const r = getSessionDb(db, id);
@@ -836,7 +1000,7 @@ export function createSessionManager(deps: SessionManagerDeps): RuntimeSessionMa
         } catch (e) {
           if (!isBalanceError(e)) throw e;
           const bal = await chain.tx.balanceOf(userOf(r.userId).treasuryAddress).catch(() => null);
-          throw fundingShortfall({ haveLovelace: bal?.lovelace, haveTusdMicro: bal?.tusdMicro, ...((n) => ({ needLovelace: n.lovelace, needTusdMicro: n.tusdMicro }))(fundingNeed(raiseArgs.outputs)), myrPerTusd: config.myrPerTusd, force: true })!;
+          throw fundingShortfall({ haveLovelace: bal?.lovelace, haveTusdMicro: bal?.tusdMicro, ...((n) => ({ needLovelace: n.lovelace, needTusdMicro: n.tusdMicro }))(fundingNeed(raiseArgs.outputs)), myrPerTusd: config.myrPerTusd, treasuryAddress: userOf(r.userId).treasuryAddress, assetUnit: tusdUnitOrUndefined(), force: true })!;
         }
         bus.emit("session_funded", { goalId: r.goalId, sessionId: id, data: { phase: "raise_submitted", txHash: res.txHash, addMicro: addMicro.toString(), addTUSD: microToTusd(addMicro), decisionId } });
         void background(
@@ -1070,6 +1234,7 @@ export function createSessionManager(deps: SessionManagerDeps): RuntimeSessionMa
           .where(and(eq(sessions.status, "FUNDING"), isNotNull(sessions.fundingConfirmedAt)))
           .orderBy(asc(sessions.createdAt), asc(sessions.letter))
           .all();
+        const starts: Promise<unknown>[] = [];
         for (const q of queued) {
           if (free <= 0) break;
           if (!depsResolved(q)) continue;
@@ -1088,12 +1253,14 @@ export function createSessionManager(deps: SessionManagerDeps): RuntimeSessionMa
           if (!sameStatus(q.id, "FUNDING")) continue;
           await mgr.transition(q.id, "RUNNING", "funding confirmed");
           free--;
-          try {
-            await startSilo(q.id);
-          } catch (e) {
-            await mgr.transition(q.id, "FAILED", `silo failed to start: ${err(e)}`);
-          }
+          // Fork without waiting for the previous silo: siblings start (and run) concurrently.
+          starts.push(
+            startSilo(q.id).catch(async (e) => {
+              await mgr.transition(q.id, "FAILED", `silo failed to start: ${err(e)}`).catch(() => undefined);
+            }),
+          );
         }
+        await Promise.all(starts);
         const stillQueued = queued.filter((q) => sameStatus(q.id, "FUNDING"));
         for (const q of stillQueued) {
           const key = `${q.id}:${depsResolved(q)}`;
@@ -1112,6 +1279,7 @@ export function createSessionManager(deps: SessionManagerDeps): RuntimeSessionMa
     },
     async shutdown() {
       stopped = true;
+      for (const goalId of [...spawnBatches.keys()]) flush(goalId); // fund what was already promised (or reject with the reason)
       await Promise.allSettled([...closing.values()]);
     },
   };

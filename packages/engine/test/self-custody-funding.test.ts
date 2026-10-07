@@ -42,7 +42,7 @@ describe("self-custody funding preflight", () => {
     const r = await call<{ error: string; code: string; faucetUrl: string }>("POST", `/goals/${goalId}/approve`, userId, {});
     expect(r.status).toBe(409);
     expect(r.body.code).toBe("insufficient_funds");
-    expect(r.body.error).toMatch(/^Your treasury has 0 tUSD; this plan needs [\d.]+ tUSD \(≈ RM[\d.]+\)\. Top up first\.$/);
+    expect(r.body.error).toMatch(/^Your treasury has 0 tUSD; this plan needs [\d.]+ tUSD \(≈ RM[\d.]+\)\. Top up first\. Shortfall: [\d.]+ tUSD \(asset [0-9a-f]+\) — send it to treasury addr_test1[0-9a-z]+\.$/);
     expect(r.body.error).not.toMatch(/UTxO Balance Insufficient/);
     expect((await call("GET", "/me", userId)).body.pendingSignatures).toHaveLength(0);
     const sessions = e.sessions.list({ goalId });

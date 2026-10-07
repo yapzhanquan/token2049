@@ -3,13 +3,21 @@
 //   routine               → counted and logged as `captain_absorbed` (batched), no LLM call
 // Restart-proof: the last handled event id is stored in kv; on start, actionable events missed while the
 // engine was down are replayed (coalesced per goal).
+// The CrewWatchdog (watchdog.ts) rides on the same stream: it turns "not moving" into actionable events
+// (session_looping / session_stalled / goal_completed), so the captain is woken to ACT instead of to observe.
 import { isActionable, type BulkheadEvent, type EventType } from "@bulkhead/shared";
 import { kv, type DB } from "@bulkhead/db";
 import { eq } from "drizzle-orm";
 import type { Captain, EventBus, SessionManager } from "../contracts";
+import { CrewWatchdog, type SessionHealth, type WatchdogOptions } from "./watchdog";
 
 /** The captain's own bookkeeping events: never classified (that would loop). */
 const SELF_EVENTS: readonly EventType[] = ["captain_woken", "captain_absorbed", "captain_action", "captain_report"];
+
+/** A captain that can read the watchdog's per-session health (CaptainAgent implements it). */
+export interface HealthAwareCaptain {
+  setHealthSource(fn: (sessionId: string) => SessionHealth | null): void;
+}
 const CURSOR_KEY = "captain:wakeCursor";
 
 export interface WakeFilterOptions {
@@ -19,6 +27,10 @@ export interface WakeFilterOptions {
   absorbFlushMs?: number;
   /** Replay at most this many missed actionable events on start. */
   replayLimit?: number;
+  /** Loop / stall thresholds for the crew watchdog. */
+  watchdog?: WatchdogOptions;
+  /** How often the watchdog scans RUNNING sessions for stalls (ms). Default min(15 s, stallMs / 4). */
+  stallCheckMs?: number;
 }
 
 export class WakeFilter {
@@ -33,6 +45,9 @@ export class WakeFilter {
   private readonly debounceMs: number;
   private readonly absorbFlushMs: number;
   private readonly replayLimit: number;
+  private readonly stallCheckMs: number;
+  private stallTimer: NodeJS.Timeout | null = null;
+  readonly watchdog: CrewWatchdog;
 
   constructor(
     private readonly deps: { bus: EventBus; captain: Captain; db: DB; sessions?: SessionManager },
@@ -41,17 +56,31 @@ export class WakeFilter {
     this.debounceMs = opts.debounceMs ?? 300;
     this.absorbFlushMs = opts.absorbFlushMs ?? 2_000;
     this.replayLimit = opts.replayLimit ?? 50;
+    this.watchdog = new CrewWatchdog({ bus: deps.bus, db: deps.db }, opts.watchdog);
+    this.stallCheckMs = opts.stallCheckMs ?? Math.max(50, Math.min(15_000, Math.floor(this.watchdog.stallMs / 4)));
+    const c = deps.captain as Partial<HealthAwareCaptain>;
+    if (typeof c.setHealthSource === "function") c.setHealthSource((id) => this.watchdog.health(id));
   }
 
   start({ replay = true }: { replay?: boolean } = {}): void {
     if (this.unsubscribe) return;
     if (replay) this.replayMissed();
     this.unsubscribe = this.deps.bus.subscribe((e) => this.onEvent(e));
+    this.stallTimer = setInterval(() => {
+      try {
+        this.watchdog.scan();
+      } catch {
+        /* DB closed during shutdown */
+      }
+    }, this.stallCheckMs);
+    this.stallTimer.unref?.();
   }
 
   async stop(): Promise<void> {
     this.unsubscribe?.();
     this.unsubscribe = null;
+    if (this.stallTimer) clearInterval(this.stallTimer);
+    this.stallTimer = null;
     await this.idle();
     this.flushAbsorbed();
   }
@@ -60,6 +89,12 @@ export class WakeFilter {
   onEvent(e: BulkheadEvent): void {
     if (SELF_EVENTS.includes(e.type)) return;
     this.maxSeen = Math.max(this.maxSeen, e.id);
+    // Deterministic loop / goal-completion detection first (it may emit an actionable event of its own).
+    try {
+      this.watchdog.observe(e);
+    } catch (err) {
+      this.deps.bus.emit("error", { goalId: e.goalId, data: { where: "captain.watchdog", message: (err as Error).message } });
+    }
     if (isActionable(e)) this.enqueue(e);
     else this.absorb(e);
   }
@@ -124,7 +159,7 @@ export class WakeFilter {
     if (p.timer) clearTimeout(p.timer);
     this.pending.delete(key);
     // user messages and decisions take priority as the primary trigger; the rest ride along.
-    const prio: EventType[] = ["user_message", "decision_opened", "payment_rejected", "handback_submitted"];
+    const prio: EventType[] = ["user_message", "decision_opened", "payment_rejected", "session_looping", "session_stalled", "goal_completed", "handback_submitted"];
     const sorted = [...p.events].sort((a, b) => {
       const pa = prio.indexOf(a.type), pb = prio.indexOf(b.type);
       return (pa < 0 ? 99 : pa) - (pb < 0 ? 99 : pb) || a.id - b.id;

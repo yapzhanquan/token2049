@@ -7,7 +7,7 @@ import { glyphFor, type Decision } from "@bulkhead/shared";
 import type { MeDTO, SessionDetailDTO } from "@bulkhead/shared";
 import { api, postSigned, useLive, useNow, useResource } from "@/lib/client";
 import { DECISION_WORD, describeEvent, sessionStatusWord } from "@/lib/describe";
-import { big, dateTimeOf, duration, myr, pct, shortAddr, timeOf, tokens, tusd } from "@/lib/money";
+import { big, dateTimeOf, duration, myr, pct, shortAddr, timeOf, tokens, tusd, TICKER } from "@/lib/money";
 import { GlyphIcon } from "./Glyph";
 import { IdChip, Reconnecting } from "./IdChip";
 import { AddrLink, TxLink } from "./Links";
@@ -399,8 +399,8 @@ function MandateControls({
       <div className="text-[12px] mid">Raising the budget or extending expiry opens a decision you must approve. Narrowing sweeps the excess back right away.</div>
       <div className="flex gap-2 items-center">
         <span className="text-[12px] w-[96px]">Raise by</span>
-        <input className="input" style={{ width: 90 }} value={raise} onChange={(e) => setRaise(e.target.value)} inputMode="decimal" aria-label="Raise budget by tUSD" />
-        <span className="text-[12px] muted">tUSD ≈ RM{(Number(raise || 0) * Number(rate)).toFixed(2)}</span>
+        <input className="input" style={{ width: 90 }} value={raise} onChange={(e) => setRaise(e.target.value)} inputMode="decimal" aria-label={`Raise budget by ${TICKER}`} />
+        <span className="text-[12px] muted">{TICKER} ≈ RM{(Number(raise || 0) * Number(rate)).toFixed(2)}</span>
         <button type="button" className="btn btn-sm ml-auto" disabled={busy || !(Number(raise) > 0)} onClick={() => control("raise", { addTUSD: raise }, "Budget raise requested — approve it in Decisions")}>
           Request
         </button>
@@ -421,7 +421,7 @@ function MandateControls({
       <div className="flex gap-2 items-center">
         <span className="text-[12px] w-[96px]">Narrow to</span>
         <input className="input" style={{ width: 90 }} value={narrow} placeholder={tusd(s.wallet.spentMicro).replace(" tUSD", "")} onChange={(e) => setNarrow(e.target.value)} inputMode="decimal" aria-label="Narrow budget to tUSD" />
-        <span className="text-[12px] muted">tUSD</span>
+        <span className="text-[12px] muted">{TICKER}</span>
         <button type="button" className="btn btn-sm ml-auto" disabled={busy || !narrow} onClick={() => control("narrow", { newBudgetTUSD: narrow }, "Budget narrowed — excess swept to treasury")}>
           Narrow
         </button>

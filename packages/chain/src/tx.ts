@@ -51,6 +51,12 @@ export interface TxServiceOptions {
   /** Protocol params cache lifetime. Default 10 min. */
   paramsTtlMs?: number;
   now?: () => number;
+  /**
+   * Settlement asset unit (policyId + asset name hex) every budget, funding output, payment and balance uses.
+   * Default (unset): Bulkhead's own operator-minted tUSD. createChain sets it from SETTLEMENT_ASSET / SETTLEMENT_UNIT
+   * (default tUSDM, see @bulkhead/shared settlement.ts).
+   */
+  settlementUnit?: string | null;
 }
 
 const toMesh = (u: Utxo): MeshUTxO => ({ input: { txHash: u.txHash, outputIndex: u.outputIndex }, output: { address: u.address, amount: u.amount } });
@@ -158,6 +164,7 @@ export class MeshTxService implements TxService {
   private readonly now: () => number;
   private paramsCache: { at: number; params: MeshProtocol } | null = null;
   private policyCache: { policyId: string; scriptCbor: string } | null = null;
+  private readonly settlementUnit: string | null;
 
   constructor(opts: TxServiceOptions) {
     if (opts.provider.network !== "preprod") throw new Error(`TxService refuses a ${opts.provider.network} provider (preprod only)`);
@@ -169,6 +176,9 @@ export class MeshTxService implements TxService {
     this.evaluate = opts.evaluateBeforeSubmit ?? false;
     this.paramsTtlMs = opts.paramsTtlMs ?? 10 * 60_000;
     this.now = opts.now ?? Date.now;
+    const su = opts.settlementUnit?.trim().toLowerCase();
+    if (su && !/^[0-9a-f]{56}[0-9a-f]{0,64}$/.test(su)) throw new Error("settlementUnit must be policyId (56 hex) + asset name hex");
+    this.settlementUnit = su || null;
   }
 
   // ── helpers ────────────────────────────────────────────────────────────────────────────
@@ -206,13 +216,24 @@ export class MeshTxService implements TxService {
     return this.policyCache;
   }
 
+  /**
+   * The SETTLEMENT unit (what budgets / funding / payments / balances use): the configured settlement asset
+   * (default tUSDM via createChain), else Bulkhead's own operator tUSD. Name kept for the TxService contract.
+   */
   tusdUnit(): string {
+    if (this.settlementUnit) return this.settlementUnit;
     if (!this.policyCache) throw new Error("tusdUnit() not ready: call `await chain.ready()` (or any operator tx) first");
     return this.policyCache.policyId + TUSD_ASSET_NAME_HEX;
   }
 
-  /** Resolve the tUSD unit (async-safe variant of tusdUnit()). */
+  /** Resolve the settlement unit (async-safe variant of tusdUnit()). */
   async tusdUnitAsync(): Promise<string> {
+    if (this.settlementUnit) return this.settlementUnit;
+    return this.operatorTusdUnitAsync();
+  }
+
+  /** Bulkhead's own operator-minted tUSD (CIP-68 333) unit, whatever the settlement asset is. */
+  async operatorTusdUnitAsync(): Promise<string> {
     const p = await this.operatorPolicy();
     return p.policyId + TUSD_ASSET_NAME_HEX;
   }
@@ -435,7 +456,10 @@ export class MeshTxService implements TxService {
     if (args.tusdMicro < 0n || args.lovelace < 0n) throw new Error("operatorSend amounts must be ≥ 0");
     const op = await this.keys.operator();
     const policy = await this.operatorPolicy();
-    const unit = policy.policyId + TUSD_ASSET_NAME_HEX;
+    // Top-ups pay the SETTLEMENT asset. Only Bulkhead's own tUSD can be minted on demand; any other settlement asset
+    // (tUSDM by default) must already be held by the operator.
+    const unit = await this.tusdUnitAsync();
+    const mintable = unit === policy.policyId + TUSD_ASSET_NAME_HEX;
     return this.queue.run(op.address, async (ctx) => {
       const [chainUtxos, tip] = await Promise.all([this.provider.fetchUtxos(op.address), this.provider.fetchTip()]);
       const { hex } = await this.buildWithFallback(ctx, chainUtxos, tip.slot, async (available) => {
@@ -443,6 +467,8 @@ export class MeshTxService implements TxService {
         const b = await this.builder();
         const have = sumUnit(available, unit);
         const mintQty = args.tusdMicro > have ? args.tusdMicro - have : 0n;
+        if (mintQty > 0n && !mintable)
+          throw new Error(`Operator holds ${have} micro of settlement unit ${unit.slice(0, 12)}…, top-up needs ${args.tusdMicro} (this asset cannot be minted; send it to the operator)`);
         if (mintQty > 0n) b.mint(mintQty.toString(), policy.policyId, TUSD_ASSET_NAME_HEX).mintingScript(policy.scriptCbor);
         const tokens: Asset[] = args.tusdMicro > 0n ? [{ unit, quantity: args.tusdMicro.toString() }] : [];
         const l = this.outputLovelace(b, args.toAddress, tokens, 0n, args.lovelace);
@@ -640,8 +666,9 @@ export class MeshTxService implements TxService {
     const utxos = await this.provider.fetchUtxos(address);
     let tusdMicro = 0n;
     let legacyTusdMicro = 0n;
+    if (this.settlementUnit) tusdMicro = sumUnit(utxos, this.settlementUnit);
     if (this.policyCache || (await this.tryPolicy())) {
-      tusdMicro = sumUnit(utxos, this.tusdUnit());
+      if (!this.settlementUnit) tusdMicro = sumUnit(utxos, this.tusdUnit());
       legacyTusdMicro = sumUnit(utxos, this.policyCache!.policyId + LEGACY_TUSD_ASSET_NAME_HEX);
     }
     return { lovelace: sumUnit(utxos, "lovelace"), tusdMicro, utxoCount: utxos.length, ...(legacyTusdMicro > 0n ? { legacyTusdMicro } : {}) };

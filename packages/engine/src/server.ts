@@ -11,6 +11,7 @@ const log = (msg: string) => console.log(`[engine] ${msg}`);
 export async function main(env: NodeJS.ProcessEnv = process.env) {
   const url = new URL(env.ENGINE_URL ?? "http://localhost:4000");
   const port = Number(url.port || 4000);
+  const hostname = engineHostname(env, url);
   if (/mainnet/i.test(env.NETWORK ?? "")) throw new Error("Bulkhead runs on Cardano preprod only");
 
   const db = openDb();
@@ -33,10 +34,9 @@ export async function main(env: NodeJS.ProcessEnv = process.env) {
     myrPerTusd: engine.config.myrPerTusd,
     captainInfo: engine.captainInfo,
     wakeStats: () => engine.wake.stats,
+    autoFundUserEmails: engine.config.autoFundUserEmails,
   });
-  const server = serve({ fetch: app.fetch, port, hostname: url.hostname === "localhost" ? undefined : url.hostname }, (info) =>
-    log(`listening on http://localhost:${info.port}`),
-  );
+  const server = serve({ fetch: app.fetch, port, hostname }, (info) => log(`listening on http://${hostname}:${info.port} (loopback only unless ENGINE_HOST says otherwise)`));
 
   let stopping = false;
   const stop = async (signal: string) => {
@@ -50,6 +50,15 @@ export async function main(env: NodeJS.ProcessEnv = process.env) {
   process.on("SIGINT", () => void stop("SIGINT"));
   process.on("SIGTERM", () => void stop("SIGTERM"));
   return { engine, app, server };
+}
+
+/** Bind address: ENGINE_HOST if set, else ENGINE_URL's host with "localhost" mapped to 127.0.0.1 — loopback by
+ * default, never all interfaces unless asked for explicitly (ENGINE_HOST=0.0.0.0). */
+export function engineHostname(env: NodeJS.ProcessEnv, url: URL): string {
+  const explicit = env.ENGINE_HOST?.trim();
+  if (explicit) return explicit;
+  const h = url.hostname.replace(/^\[|\]$/g, "");
+  return !h || h === "localhost" ? "127.0.0.1" : h;
 }
 
 const isMain = !!process.argv[1] && resolve(fileURLToPath(import.meta.url)) === resolve(process.argv[1]);

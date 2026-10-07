@@ -21,6 +21,8 @@ import {
   dbSweepTarget,
   inputFieldOf,
   masumiConfigFromEnv,
+  mpsTimingError,
+  registryEntryFromMetadata,
   toTusdMicro,
   type MasumiConfig,
   type MasumiMarket,
@@ -35,6 +37,10 @@ const WALLET = fakeAddress("masumi:purchasing");
 const POLICY = "ab".repeat(28);
 const agentId = (n: number) => POLICY + n.toString(16).padStart(8, "0") + "cd".repeat(8);
 const SELLER = (n: number) => `https://seller${n}.test`;
+/** The V2 escrow contract of the fake MPS's payment source (live MPS: GET /payment-source smartContractAddress). */
+const ESCROW = "addr_test1wzs4e6wc95hkwezlccjw9mdvq0r0rsgx6zk34avptga3ftgn37w4g";
+const BF = "https://cardano-preprod.blockfrost.test/api/v0";
+const BF_KEY = "preprodBlockfrostKey";
 
 // ─────────────────────────── fake MPS + fake sellers ───────────────────────────
 interface FakePurchase {
@@ -60,7 +66,32 @@ function createFakeMasumi(opts: { now?: () => number } = {}) {
   const transfers: { id: string; body: Record<string, unknown>; status: string; txHash: string | null }[] = [];
   const calls: { method: string; path: string; token: string | null; body: unknown }[] = [];
   const sellerJobs = new Map<string, SellerJob>(); // jobId → job
-  const sellerCfg: Record<string, { tamperInputHash?: boolean; tamperResult?: boolean; dynamicAmounts?: { unit: string; amount: string }[]; fail?: boolean; payByInMs?: number; result?: string; inputSchema?: unknown }> = {};
+  const sellerCfg: Record<
+    string,
+    {
+      tamperInputHash?: boolean;
+      tamperResult?: boolean;
+      dynamicAmounts?: { unit: string; amount: string }[];
+      fail?: boolean;
+      payByInMs?: number;
+      unlockInMs?: number;
+      result?: string;
+      inputSchema?: unknown;
+      /** extra signed fields echoed in the start_job response (sellerReturnAddress, paymentForceLayer, …) */
+      extra?: Record<string, unknown>;
+      /** /status returns the skill's `output` field instead of `result` */
+      useOutput?: boolean;
+      /** /availability answers an HTML page with HTTP 200 (seen live) */
+      htmlAvailability?: boolean;
+    }
+  > = {};
+  /** MPS GET /payment-source (live shape, 2026-10-07). */
+  const paymentSources: Record<string, unknown>[] = [
+    { id: "ps2", network: "Preprod", paymentSourceType: "Web3CardanoV2", policyId: POLICY, smartContractAddress: ESCROW },
+    { id: "ps1", network: "Preprod", paymentSourceType: "Web3CardanoV1", policyId: POLICY, smartContractAddress: "addr_test1wzv1contract" },
+  ];
+  /** Blockfrost: registry NFTs per unit (onchain_metadata in CIP-25 form) + quantity. */
+  const chainAssets = new Map<string, { quantity: string; meta: Record<string, unknown> | null }>();
   let purchaseFailure: number | null = null; // next POST /purchase answers this HTTP status
   let jobN = 0;
   const ok = (data: unknown) => new Response(JSON.stringify({ status: "success", data }), { status: 200, headers: { "content-type": "application/json" } });
@@ -72,11 +103,26 @@ function createFakeMasumi(opts: { now?: () => number } = {}) {
     const body = init?.body ? JSON.parse(String(init.body)) : undefined;
     const token = (init?.headers as Record<string, string> | undefined)?.token ?? null;
     calls.push({ method, path: url.pathname + url.search, token, body });
+    if (url.host === "cardano-preprod.blockfrost.test") {
+      if ((init?.headers as Record<string, string> | undefined)?.project_id !== BF_KEY) return err(403, "Invalid project token.");
+      const pol = /^\/api\/v0\/assets\/policy\/([0-9a-f]{56})$/.exec(url.pathname);
+      if (pol) {
+        const rows = [...chainAssets.entries()].filter(([u]) => u.startsWith(pol[1]!)).map(([asset, a]) => ({ asset, quantity: a.quantity }));
+        const page = Number(url.searchParams.get("page") ?? "1");
+        const out = rows.slice((page - 1) * 100, page * 100);
+        return out.length || page === 1 ? new Response(JSON.stringify(out)) : err(404, "not found");
+      }
+      const one = /^\/api\/v0\/assets\/([0-9a-f]+)$/.exec(url.pathname);
+      const a = one ? chainAssets.get(one[1]!) : undefined;
+      if (!a) return err(404, "The requested component has not been found.");
+      return new Response(JSON.stringify({ asset: one![1], quantity: a.quantity, onchain_metadata: a.meta }));
+    }
     if (url.host === "mps.test") {
       const path = url.pathname.replace(/^\/api\/v1/, "");
       const admin = token === ADMIN;
       if (token !== BUYER && !admin) return err(401, "Unauthorized");
       if (method === "GET" && path === "/wallet/list") return ok({ Wallets: [{ id: "w1", walletAddress: WALLET, walletVkey: "vk", type: "Purchasing" }] });
+      if (method === "GET" && path === "/payment-source") return ok({ PaymentSources: paymentSources });
       if (method === "GET" && path === "/registry") return ok({ Assets: url.searchParams.get("filterPaymentSourceType") ? registry.filter((r) => r.paymentSourceType === "Web3CardanoV2") : registry.filter((r) => r.paymentSourceType !== "Web3CardanoV2") });
       if (method === "POST" && path === "/purchase") {
         if (purchaseFailure) {
@@ -122,12 +168,12 @@ function createFakeMasumi(opts: { now?: () => number } = {}) {
     const n = Number(/^seller(\d+)\.test$/.exec(url.host)?.[1]);
     if (!n) return err(404, "unknown host");
     const c = sellerCfg[n] ?? {};
-    if (url.pathname === "/availability") return new Response(JSON.stringify({ status: "available", type: "masumi-agent" }));
+    if (url.pathname === "/availability") return c.htmlAvailability ? new Response("<!DOCTYPE html><html></html>", { headers: { "content-type": "text/html" } }) : new Response(JSON.stringify({ status: "available", type: "masumi-agent" }));
     if (url.pathname === "/input_schema") return new Response(JSON.stringify(c.inputSchema ?? { input_data: [{ id: "prompt", type: "string", name: "Prompt" }] }));
     if (url.pathname === "/start_job" && method === "POST") {
       const jobId = `job-${n}-${++jobN}`;
       const nonce = body.identifier_from_purchaser as string;
-      const bcid = `bcid${"0".repeat(10)}${jobN}${nonce}`;
+      const bcid = `bc1d${"0".repeat(10)}${jobN.toString(16).padStart(4, "0")}${nonce}`; // hex, like the real LZ-compressed identifier
       sellerJobs.set(jobId, { nonce, input: body.input_data, bcid, status: "awaiting_payment" });
       const t = now();
       return new Response(
@@ -136,7 +182,7 @@ function createFakeMasumi(opts: { now?: () => number } = {}) {
           blockchainIdentifier: bcid,
           payByTime: String(t + (c.payByInMs ?? 10 * 60_000)),
           submitResultTime: String(t + 20 * 60_000),
-          unlockTime: String(t + 36 * 60_000),
+          unlockTime: String(t + (c.unlockInMs ?? 36 * 60_000)),
           externalDisputeUnlockTime: String(t + 52 * 60_000),
           agentIdentifier: agentId(n),
           sellerVKey: "11".repeat(28),
@@ -145,6 +191,7 @@ function createFakeMasumi(opts: { now?: () => number } = {}) {
           paymentSourceType: "Web3CardanoV2",
           supportedPaymentSourceIndex: 0,
           ...(c.dynamicAmounts ? { amounts: c.dynamicAmounts } : {}),
+          ...c.extra,
         }),
       );
     }
@@ -159,7 +206,7 @@ function createFakeMasumi(opts: { now?: () => number } = {}) {
         const honest = mip004ResultHash(j.result, j.nonce);
         p.resultHash = c.tamperResult ? mip004ResultHash(j.result + " (edited)", j.nonce) : honest;
         p.onChainState = "ResultSubmitted";
-        return new Response(JSON.stringify({ status: "completed", result: j.result }));
+        return new Response(JSON.stringify(c.useOutput ? { status: "completed", output: j.result } : { status: "completed", result: j.result }));
       }
       return new Response(JSON.stringify({ status: p ? "running" : "awaiting_payment" }));
     }
@@ -169,6 +216,8 @@ function createFakeMasumi(opts: { now?: () => number } = {}) {
   return {
     fetchImpl,
     registry,
+    paymentSources,
+    chainAssets,
     purchases,
     transfers,
     calls,
@@ -206,7 +255,7 @@ const entry = (n: number, over: Record<string, unknown> = {}) => ({
   agentIdentifier: agentId(n),
   paymentSourceType: "Web3CardanoV2",
   AgentPricing: null,
-  supportedPaymentSources: [{ chain: "Cardano", network: "Preprod", paymentSourceType: "Web3CardanoV2", address: "addr_test1wz", pricing: { pricingType: "Fixed", fixed: [{ asset: PREPROD_TUSDM_UNIT, amount: "2000000" }] } }],
+  supportedPaymentSources: [{ chain: "Cardano", network: "Preprod", paymentSourceType: "Web3CardanoV2", address: ESCROW, pricing: { pricingType: "Fixed", fixed: [{ asset: PREPROD_TUSDM_UNIT, amount: "2000000" }] } }],
   ...over,
 });
 
@@ -293,17 +342,17 @@ describe("Masumi discovery", () => {
     h = await setupMasumi({
       registry: [
         entry(1), // Fixed 2 tUSDM → 2 tUSD, equivalent
-        entry(2, { supportedPaymentSources: [{ chain: "Cardano", network: "Preprod", paymentSourceType: "Web3CardanoV2", address: "x", pricing: { pricingType: "Fixed", fixed: [{ asset: FAKE_TUSD_UNIT, amount: "1500000" }] } }] }), // exact tUSD
-        entry(3, { supportedPaymentSources: [{ chain: "Cardano", network: "Preprod", paymentSourceType: "Web3CardanoV2", address: "x", pricing: { pricingType: "Dynamic" } }] }),
-        entry(4, { supportedPaymentSources: [{ chain: "Cardano", network: "Preprod", paymentSourceType: "Web3CardanoV2", address: "x", pricing: { pricingType: "Free" } }] }),
-        entry(5, { supportedPaymentSources: [{ chain: "Cardano", network: "Preprod", paymentSourceType: "Web3CardanoV2", address: "x", pricing: { pricingType: "Fixed", fixed: [{ asset: "lovelace", amount: "5000000" }] } }] }),
+        entry(2, { supportedPaymentSources: [{ chain: "Cardano", network: "Preprod", paymentSourceType: "Web3CardanoV2", address: ESCROW, pricing: { pricingType: "Fixed", fixed: [{ asset: FAKE_TUSD_UNIT, amount: "1500000" }] } }] }), // exact tUSD
+        entry(3, { supportedPaymentSources: [{ chain: "Cardano", network: "Preprod", paymentSourceType: "Web3CardanoV2", address: ESCROW, pricing: { pricingType: "Dynamic" } }] }),
+        entry(4, { supportedPaymentSources: [{ chain: "Cardano", network: "Preprod", paymentSourceType: "Web3CardanoV2", address: ESCROW, pricing: { pricingType: "Free" } }] }),
+        entry(5, { supportedPaymentSources: [{ chain: "Cardano", network: "Preprod", paymentSourceType: "Web3CardanoV2", address: ESCROW, pricing: { pricingType: "Fixed", fixed: [{ asset: "lovelace", amount: "5000000" }] } }] }),
         entry(6, { apiBaseUrl: "http://127.0.0.1:21950" }),
         entry(7, { state: "RegistrationRequested" }),
         entry(8, { type: "X402" }),
-        entry(9, { supportedPaymentSources: [{ chain: "Cardano", network: "Mainnet", paymentSourceType: "Web3CardanoV2", address: "x", pricing: { pricingType: "Fixed", fixed: [{ asset: PREPROD_TUSDM_UNIT, amount: "1" }] } }] }),
+        entry(9, { supportedPaymentSources: [{ chain: "Cardano", network: "Mainnet", paymentSourceType: "Web3CardanoV2", address: ESCROW, pricing: { pricingType: "Fixed", fixed: [{ asset: PREPROD_TUSDM_UNIT, amount: "1" }] } }] }),
         // V1 legacy pricing (AgentPricing) via the second /registry query
         entry(10, { paymentSourceType: "Web3CardanoV1", supportedPaymentSources: null, AgentPricing: { pricingType: "Fixed", Pricing: [{ unit: PREPROD_TUSDM_UNIT, amount: "3000000" }] } }),
-        entry(11, { supportedPaymentSources: [{ chain: "Cardano", network: "Preprod", paymentSourceType: "Web3CardanoV2", address: "x", pricing: { pricingType: "Fixed", fixed: [{ asset: PREPROD_TUSDM_UNIT, amount: "500000000" }] } }] }), // 500 > max 100
+        entry(11, { supportedPaymentSources: [{ chain: "Cardano", network: "Preprod", paymentSourceType: "Web3CardanoV2", address: ESCROW, pricing: { pricingType: "Fixed", fixed: [{ asset: PREPROD_TUSDM_UNIT, amount: "500000000" }] } }] }), // 500 > max 100
       ],
     });
     const cat = await h.market.catalog();
@@ -419,7 +468,7 @@ describe("Masumi hire: vault funding → MPS purchase → MIP-004 verified resul
   });
 
   it("Dynamic pricing takes the seller's signed amounts; a quote above MASUMI_MAX_PRICE_TUSD or a bad input_hash is refused before any money moves", async () => {
-    const dyn = entry(3, { supportedPaymentSources: [{ chain: "Cardano", network: "Preprod", paymentSourceType: "Web3CardanoV2", address: "x", pricing: { pricingType: "Dynamic" } }] });
+    const dyn = entry(3, { supportedPaymentSources: [{ chain: "Cardano", network: "Preprod", paymentSourceType: "Web3CardanoV2", address: ESCROW, pricing: { pricingType: "Dynamic" } }] });
     h = await setupMasumi({ registry: [dyn, entry(4)], cfg: { maxPriceMicro: 3_000_000n } });
     const [id] = await h.start([hirer()]);
     const cat = await h.market.catalog();
@@ -581,5 +630,165 @@ describe("Masumi persistence", () => {
     const m2 = createMasumiMarket({ network: "Preprod", mpsUrl: MPS, buyerToken: BUYER, adminToken: ADMIN, tusdUnit: FAKE_TUSD_UNIT }, { fetchImpl: h.fake.fetchImpl, store: dbMasumiStore(h.db), funding: dbFundingLookup(h.db), sweepTarget: dbSweepTarget(h.db), log: () => undefined });
     await waitFor(() => h!.paymentOf(id!)[0]?.status === "confirmed", 3_000, "funding confirmed");
     expect((await pollUntil(m2, svc, job.jobId, h.fake, ["completed"])).status).toBe("completed");
+  });
+});
+
+// ─────────────────────────── verified against the MPS source + live reads (2026-10-07) ───────────────────────────
+/** CIP-25 text over 64 bytes is stored as an array of chunks (MPS metadataToString joins them). */
+const chunk = (s: string): string | string[] => (s.length > 64 ? s.match(/.{1,64}/g)! : s);
+const chainMeta = (n: number, over: Record<string, unknown> = {}, source: Record<string, unknown> = {}) => ({
+  name: `Chain Agent ${n}`,
+  description: "on-chain registry entry",
+  api_base_url: chunk(SELLER(n)),
+  tags: ["research"],
+  image: "https://img.test/x.png",
+  metadata_version: "2",
+  author: { name: "Seller" },
+  supported_payment_sources: [
+    {
+      chain: "Cardano",
+      network: "Preprod",
+      settlement: { paymentSourceType: "Web3CardanoV2", address: chunk(ESCROW) },
+      pricing: { pricingType: "Fixed", fixed: [{ asset: chunk(PREPROD_TUSDM_UNIT), amount: "1000000" }] },
+      ...source,
+    },
+  ],
+  ...over,
+});
+
+describe("Masumi discovery from the on-chain registry (buyer key sees no MPS /registry entries)", () => {
+  it("enumerates the MPS payment source's registry policy via Blockfrost and keeps only agents purchasable on this MPS", async () => {
+    h = await setupMasumi({ registry: [], cfg: { blockfrostProjectId: BF_KEY, blockfrostUrl: BF } });
+    h.fake.chainAssets.set(agentId(1), { quantity: "1", meta: chainMeta(1) });
+    h.fake.chainAssets.set(agentId(2), { quantity: "0", meta: chainMeta(2) }); // deregistered (burnt)
+    h.fake.chainAssets.set(agentId(3), { quantity: "1", meta: chainMeta(3, { type: "OpenAPI", api_base_url: undefined, openapi_spec_url: SELLER(3) }) });
+    h.fake.chainAssets.set(agentId(4), { quantity: "1", meta: chainMeta(4, {}, { settlement: { paymentSourceType: "Web3CardanoV2", address: "addr_test1wzsomeothercontract" } }) });
+    h.fake.chainAssets.set(agentId(5), { quantity: "1", meta: chainMeta(5, {}, { pricing: { pricingType: "Dynamic" } }) });
+    const cat = await h.market.catalog();
+    expect(cat.map((a) => a.name).sort()).toEqual(["Chain Agent 1", "Chain Agent 5"]);
+    expect(cat.find((a) => a.name === "Chain Agent 1")).toMatchObject({ priceTUSD: "1", fundingMode: "equivalent", endpoint: SELLER(1), agentIdentifier: agentId(1), amounts: [{ unit: PREPROD_TUSDM_UNIT, amount: "1000000" }] });
+    const why = Object.fromEntries(h.market.discoveryReport().excluded.map((x) => [x.name, x.reason]));
+    expect(why["Chain Agent 3"]).toMatch(/OpenApi/);
+    expect(why["Chain Agent 4"]).toMatch(/escrow contract is not configured on this MPS/);
+    expect(why["Chain Agent 2"]).toBeUndefined(); // burnt NFTs are not entries at all
+    // Blockfrost gets the project id header, never the MPS token
+    const bfCalls = () => h!.fake.calls.filter((c) => c.path.startsWith("/api/v0/"));
+    expect(bfCalls().length).toBeGreaterThan(0);
+    expect(bfCalls().every((c) => c.token === null)).toBe(true);
+    // metadata is cached: a second catalog pass re-lists the policy but does not refetch the assets
+    const assetReads = () => bfCalls().filter((c) => /^\/api\/v0\/assets\/[0-9a-f]+$/.test(c.path)).length;
+    const before = assetReads();
+    h.market.invalidate();
+    await h.market.catalog();
+    expect(assetReads()).toBe(before);
+
+    // and the hire goes all the way through (start_job → funding → POST /purchase → verified result)
+    const [id] = await h.start([hirer()]);
+    const svc = cat.find((a) => a.name === "Chain Agent 1")!.id;
+    const { job } = await h.hire(id!, svc);
+    await waitFor(() => h!.paymentOf(id!)[0]?.status === "confirmed", 3_000, "funding confirmed");
+    expect((await pollUntil(h.market, svc, job.jobId, h.fake, ["completed", "failed"])).status).toBe("completed");
+  });
+
+  it("MASUMI_AGENT_IDS pins discovery; an agent on a registry policy this MPS has no payment source for is excluded", async () => {
+    const foreign = "cd".repeat(28) + "00000001" + "ef".repeat(8);
+    h = await setupMasumi({ registry: [], cfg: { blockfrostProjectId: BF_KEY, blockfrostUrl: BF, agentIds: [agentId(1), foreign] } });
+    h.fake.chainAssets.set(agentId(1), { quantity: "1", meta: chainMeta(1) });
+    h.fake.chainAssets.set(agentId(6), { quantity: "1", meta: chainMeta(6) }); // not pinned → never read
+    h.fake.chainAssets.set(foreign, { quantity: "1", meta: chainMeta(7) });
+    const cat = await h.market.catalog();
+    expect(cat.map((a) => a.name)).toEqual(["Chain Agent 1"]);
+    expect(h.market.discoveryReport().excluded).toEqual([{ name: "Chain Agent 7", agentIdentifier: foreign, reason: "registry policy has no payment source on this MPS" }]);
+    expect(h.fake.calls.some((c) => c.path.includes("/assets/policy/"))).toBe(false);
+  });
+
+  it("config: a Blockfrost preprod key turns on-chain discovery on; mainnet Blockfrost is refused", () => {
+    const c = masumiConfigFromEnv({ MPS_BUYER_TOKEN: "x", BLOCKFROST_PREPROD_PROJECT_ID: BF_KEY, MASUMI_AGENT_IDS: `${agentId(1)}, ${agentId(2)}` }, FAKE_TUSD_UNIT, "/nonexistent");
+    expect(c).toMatchObject({ blockfrostProjectId: BF_KEY, agentIds: [agentId(1), agentId(2)] });
+    expect(masumiConfigFromEnv({ MPS_BUYER_TOKEN: "x", BLOCKFROST_PREPROD_PROJECT_ID: BF_KEY, MASUMI_ONCHAIN_DISCOVERY: "0" }, FAKE_TUSD_UNIT, "/nonexistent").blockfrostProjectId).toBeUndefined();
+    expect(() => createMasumiMarket({ ...c, blockfrostUrl: "https://cardano-mainnet.blockfrost.io/api/v0" }, { store: { get: () => null, set() {}, list: () => [] }, funding: () => null, sweepTarget: () => null })).toThrow(/preprod/);
+  });
+
+  it("registryEntryFromMetadata joins CIP-25 chunks and maps V1 agentPricing", () => {
+    const e = registryEntryFromMetadata(agentId(9), { ...chainMeta(9), supported_payment_sources: undefined, agentPricing: { pricingType: "Fixed", fixedPricing: [{ unit: chunk(PREPROD_TUSDM_UNIT), amount: 3000000 }] } });
+    expect(e).toMatchObject({ name: "Chain Agent 9", type: "Standard", apiBaseUrl: SELLER(9), supportedPaymentSources: null, AgentPricing: { pricingType: "Fixed", Pricing: [{ unit: PREPROD_TUSDM_UNIT, amount: "3000000" }] } });
+    const v2 = registryEntryFromMetadata(agentId(1), chainMeta(1));
+    expect(v2.supportedPaymentSources).toEqual([{ chain: "Cardano", network: "Preprod", paymentSourceType: "Web3CardanoV2", address: ESCROW, pricing: { pricingType: "Fixed", fixed: [{ asset: PREPROD_TUSDM_UNIT, amount: "1000000" }] } }]);
+  });
+});
+
+describe("Masumi seller terms vs MPS POST /purchase rules", () => {
+  it("passes the signed sellerReturnAddress + paymentForceLayer back verbatim", async () => {
+    h = await setupMasumi();
+    const [id] = await h.start([hirer()]);
+    const svc = (await h.market.catalog())[0]!.id;
+    const ret = "addr_test1qr0rnnrhe6tlj5cls2xcunaxvl8kgaa6henck5hjd2fvpw073tfdyz2574tg4rnazrw23t2klnd3ldlx22zdf75y7cnqpcvlyj";
+    h.fake.sellerCfg[1] = { extra: { sellerReturnAddress: ret, paymentForceLayer: null } };
+    const { job } = await h.hire(id!, svc);
+    await waitFor(() => h!.paymentOf(id!)[0]?.status === "confirmed", 3_000, "funding confirmed");
+    expect((await pollUntil(h.market, svc, job.jobId, h.fake, ["completed", "failed"])).status).toBe("completed");
+    expect([...h.fake.purchases.values()][0]!.body).toMatchObject({ sellerReturnAddress: ret, paymentForceLayer: null });
+  });
+
+  it("refuses before any money moves: Hydra-forced terms, deadlines MPS would reject, a non-MIP-003 /availability", async () => {
+    h = await setupMasumi();
+    const [id] = await h.start([hirer()]);
+    const svc = (await h.market.catalog())[0]!.id;
+    h.fake.sellerCfg[1] = { extra: { paymentForceLayer: "Hydra" } };
+    await expect(h.hire(id!, svc)).rejects.toThrow(/settlement layer Hydra/);
+    h.fake.sellerCfg[1] = { unlockInMs: 25 * 60_000 }; // submitResult +20 → unlock must be ≥ +35
+    await expect(h.hire(id!, svc)).rejects.toThrow(/MPS would refuse these terms: unlockTime/);
+    h.fake.sellerCfg[1] = { htmlAvailability: true };
+    await expect(h.hire(id!, svc)).rejects.toThrow(/agent unavailable/);
+    expect(h.paymentOf(id!)).toHaveLength(0);
+  });
+
+  it("accepts the skill's `output` field from /status", async () => {
+    h = await setupMasumi();
+    const [id] = await h.start([hirer()]);
+    const svc = (await h.market.catalog())[0]!.id;
+    h.fake.sellerCfg[1] = { useOutput: true, result: "plain output" };
+    const { job } = await h.hire(id!, svc);
+    await waitFor(() => h!.paymentOf(id!)[0]?.status === "confirmed", 3_000, "funding confirmed");
+    const r = await pollUntil(h.market, svc, job.jobId, h.fake, ["completed", "failed"]);
+    expect(r).toMatchObject({ status: "completed", result: "plain output", resultHash: mip004ResultHash("plain output", job.reference) });
+  });
+
+  it("an escrow lock that never happens by payByTime + grace counts as unused funding and is swept back", async () => {
+    h = await setupMasumi();
+    const [id] = await h.start([hirer()]);
+    const svc = (await h.market.catalog())[0]!.id;
+    const { job } = await h.hire(id!, svc);
+    await waitFor(() => h!.paymentOf(id!)[0]?.status === "confirmed", 3_000, "funding confirmed");
+    await h.market.status(svc, job.jobId); // posts the purchase; the fake never locks it
+    expect(h.market.job(job.jobId)!.phase).toBe("purchased");
+    expect((await h.market.status(svc, job.jobId)).status).toBe("awaiting_payment"); // still inside payByTime
+    const rec = h.market.job(job.jobId)!;
+    dbMasumiStore(h.db).set(`masumi:job:${job.jobId}`, JSON.stringify({ ...rec, terms: { ...rec.terms, payByTime: String(Date.now() - 16 * 60_000) } }));
+    expect((await h.market.status(svc, job.jobId)).status).toBe("failed");
+    expect(h.market.job(job.jobId)!).toMatchObject({ phase: "funding_unused", error: expect.stringMatching(/escrow lock never happened/) });
+    await h.market.tick();
+    expect(h.fake.transfers[0]!.body).toMatchObject({ toAddress: h.treasury, assets: [{ unit: FAKE_TUSD_UNIT, quantity: "2000000" }] });
+  });
+
+  it("mpsTimingError mirrors resolvePurchaseCreationContext", () => {
+    const at = 1_000_000_000_000;
+    const M = 60_000;
+    const ok = { payByTime: String(at + 10 * M), submitResultTime: String(at + 20 * M), unlockTime: String(at + 36 * M), externalDisputeUnlockTime: String(at + 52 * M) };
+    expect(mpsTimingError(ok, at)).toBeNull();
+    expect(mpsTimingError({ ...ok, payByTime: String(at + 16 * M) }, at)).toMatch(/payByTime must be/);
+    expect(mpsTimingError(ok, at + 6 * M)).toMatch(/submitResultTime is less than 15 min/);
+    expect(mpsTimingError({ ...ok, unlockTime: String(at + 30 * M) }, at)).toMatch(/unlockTime/);
+    expect(mpsTimingError({ ...ok, externalDisputeUnlockTime: String(at + 40 * M) }, at)).toMatch(/externalDisputeUnlockTime/);
+  });
+
+  it("input_schema: display-only `none` fields are skipped (live Kodosumi/Sokosumi schemas)", () => {
+    // live 2026-10-07: expert-travel-advisor-eve.vercel.app/input_schema
+    expect(inputFieldOf({ input_data: [{ id: "request", type: "string", name: "Stay request", validations: [{ validation: "min", value: "1" }] }] })).toBe("request");
+    // kodosumi …/uplift/ruth: info (none) + several optional textareas → ambiguous → not hireable from free text
+    expect(inputFieldOf({ input_data: [{ id: "info", type: "none", validations: null }, { id: "assets", type: "textarea", validations: [{ validation: "optional", value: "true" }] }, { id: "asset_urls", type: "textarea", validations: [{ validation: "optional", value: "true" }] }] })).toBeNull();
+    expect(inputFieldOf({ input_data: [{ id: "info", type: "none", validations: null }, { id: "brief", type: "textarea" }] })).toBe("brief");
+    // MIP-003 grouped form
+    expect(inputFieldOf({ input_groups: [{ id: "g1", title: "Details", input_data: [{ id: "query", type: "string" }] }] })).toBe("query");
   });
 });

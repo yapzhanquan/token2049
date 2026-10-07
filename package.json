@@ -8,6 +8,7 @@
   },
   "scripts": {
     "dev": "concurrently -n engine,web,market -c blue,magenta,green \"pnpm --filter @bulkhead/engine dev\" \"pnpm --filter @bulkhead/web dev\" \"pnpm --filter @bulkhead/mock-market dev\"",
+    "dev:stable": "concurrently -n engine,web,market -c blue,magenta,green \"pnpm --filter @bulkhead/engine dev:stable\" \"pnpm --filter @bulkhead/web dev\" \"pnpm --filter @bulkhead/mock-market start\"",
     "setup:chain": "pnpm --filter @bulkhead/engine setup:chain",
     "recover": "pnpm --filter @bulkhead/engine recover",
     "e2e:preprod": "pnpm --filter @bulkhead/engine e2e:preprod",

@@ -6,7 +6,7 @@ import { useEffect, useMemo, useState } from "react";
 import { tusdToMicro } from "@bulkhead/shared";
 import type { MeDTO, PlanResponse } from "@bulkhead/shared";
 import { api, ApiError, postSigned, useConfig, useResource } from "@/lib/client";
-import { ada, myr, tusd } from "@/lib/money";
+import { ada, myr, tusd, TICKER } from "@/lib/money";
 import { planToTree } from "@/lib/tree-layout";
 import { Modal } from "./Modal";
 import { TopUpDialog } from "./TopUpDialog";
@@ -129,12 +129,12 @@ export function GoalComposer({ me: meProp, onClose, onStarted }: { me: MeDTO | n
                 <div className="seg">
                   {(["MYR", "tUSD"] as const).map((u) => (
                     <button key={u} type="button" aria-pressed={unit === u} onClick={() => setUnit(u)}>
-                      {u}
+                      {u === "tUSD" ? TICKER : u}
                     </button>
                   ))}
                 </div>
               </div>
-              <span className="text-[11.5px] muted">{budgetTUSD ? `= ${budgetTUSD} tUSD ≈ ${myr(tusdToMicro(budgetTUSD), rate)}` : ""}</span>
+              <span className="text-[11.5px] muted">{budgetTUSD ? `= ${budgetTUSD} ${TICKER} ≈ ${myr(tusdToMicro(budgetTUSD), rate)}` : ""}</span>
             </label>
             <label className="flex flex-col gap-1">
               <span className="label">Deadline</span>
