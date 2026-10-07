@@ -226,3 +226,36 @@ the chain lock (02:34–02:41 UTC). Dedicated custodial test user `u_4e28e5cd-6f
 Not exercised on chain here: the self-custody (CIP-30) variant of the preflight (same code path — the check runs on
 the wallet address before the unsigned tx is built; covered by unit tests), and the "Top up RM50" button in the
 browser (UI built and typechecked; the API flow it drives is the one above).
+
+## Masumi registration (2026-10-07, masumi-registration agent): "Bulkhead Captain" on the dedicated MPS
+
+Dedicated Masumi Payment Service `http://127.0.0.1:3901` (rev `d569a33`, DB `bulkhead_mps_920528`), Preprod
+`Web3CardanoV2` payment source `cmuxiwa720004owvcvkjr2rh3` (contract
+`addr_test1wzs4e6wc95hkwezlccjw9mdvq0r0rsgx6zk34avptga3ftgn37w4g`). Registration POST made under the chain lock
+(03:22–03:32 UTC); lock released after confirmation. Checkpoint (public fields only):
+`apps/sokosumi-worker/.local/registration-state.json`.
+
+| item | value | label |
+|---|---|---|
+| Seller balance before registration | 700000000 lovelace (Blockfrost HTTP 200, 03:22:27Z) | VERIFIED |
+| Registry entry | id `cmuxjl4ij0000v4vcxwbqulbs`, name "Bulkhead Captain", type Standard, Author "Bulkhead team", Tags bulkhead/cardano/vaults/multi-agent/crew/payments | VERIFIED (MPS `GET /registry`) |
+| Pricing | `supportedPaymentSources[0].pricing = {"pricingType":"Dynamic"}` → supported source index **0** | VERIFIED |
+| State | RegistrationRequested 03:22:42Z → RegistrationInitiated ~03:30Z → **RegistrationConfirmed** 03:32Z | VERIFIED |
+| Registration (mint) tx | [768b226e…41f223](https://preprod.cardanoscan.io/transaction/768b226ef8dbe70045abff23a7688c969822c935fd43d95b92ba6bfbf841f223), block 5262941, fee 274626 lovelace | VERIFIED (MPS + Blockfrost `/txs`, HTTP 200) |
+| agentIdentifier | `67ab0c92c4ac1610895a1c965ee50aba41a8f1513b15240723b3bd0b10d33eba055f7a8408ae351621383719ff41089f7fde1e55bb737b67c5000000` | VERIFIED: Blockfrost `/assets` quantity 1, initial mint tx = the tx above, NFT output at the selling wallet `addr_test1qrugzwff…3a3hpx` |
+| Seller balance after | 699553889 lovelace (−446111: reg fee 274626 + ≈171485 other, likely collateral setup) | VERIFIED amount; split INFERRED |
+| ~7.5 min Requested→Initiated | consistent with collateral creation + MPS 300 s wallet-lock timeout (demo gotcha); no error, no retry | INFERRED |
+| apiBaseUrl | `http://127.0.0.1:4200` — loopback, not publicly reachable (fine for a private Coworker); not listening at registration time, MPS did not probe it | VERIFIED value; reachability by outside buyers: none |
+
+Scoped MPS keys (values never printed; files owner-only ACL):
+
+| key | scope | file | check |
+|---|---|---|---|
+| runtime `cmuxjl84p0003v4vc5xdp8mc9` | ReadAndPay (canAdmin false), usageLimited false, Preprod / `cardano:preprod` only, wallet scope = Selling wallet `cmuxiwa790009owvcaofhehg1` | `apps/sokosumi-worker/.local/mps-runtime.env` (`MPS_RUNTIME_TOKEN`) | VERIFIED `GET /api-key-status` + `GET /payment-source` HTTP 200 |
+| buyer `cmuxjl8ed0005v4vcxrhqbopd` | ReadAndPay (canAdmin false), usageLimited false, Preprod only, wallet scope = Purchasing wallet `cmuxiwa790008owvc4fqcegab` | `.local/mps-buyer.env` (`MPS_BUYER_TOKEN`) | VERIFIED same reads |
+
+Purchasing wallet `addr_test1qr0rnnrhe6tlj5cls2xcunaxvl8kgaa6henck5hjd2fvpw073tfdyz2574tg4rnazrw23t2klnd3ldlx22zdf75y7cnqpcvlyj`:
+Blockfrost HTTP 404 at 03:32Z = **unmeasured** (never funded), not zero. Needs test ADA (and tUSDM) before Bulkhead
+can buy from other Masumi agents.
+
+Not exercised: any paid payment/purchase through these keys; the Standard API on :4200 was not running.

@@ -7,7 +7,11 @@
     "url": "http://127.0.0.1:3901",
     "health": "VERIFIED status=success data.status=ok",
     "loopbackOnly": "VERIFIED listener 127.0.0.1:3901; LAN IP refused",
-    "database": { "name": "bulkhead_mps_920528", "host": "127.0.0.1:5433", "engine": "embedded PostgreSQL 18 (dedicated instance, UTF8)" },
+    "database": {
+      "name": "bulkhead_mps_920528",
+      "host": "127.0.0.1:5433",
+      "engine": "embedded PostgreSQL 18 (dedicated instance, UTF8)"
+    },
     "seed": "VERIFIED attempt 2 exit 0 (attempt 1 failed before wallet creation: empty PAYMENT_SMART_CONTRACT_ADDRESS_PREPROD override; DB recreated empty, no wallets lost); output kept private, never read",
     "paymentSource": {
       "id": "cmuxiwa720004owvcvkjr2rh3",
@@ -17,14 +21,51 @@
     "sellingWallet": {
       "address": "addr_test1qrugzwffwe237uxrmv3lqzvgez68086kzaxv27d0jty7hh4sf2m6a38zf4kzk7hycynsjpd3yal5urtjh43fsc37dqss3a3hpx",
       "ownership": "VERIFIED via MPS API /wallet/list + direct check in bulkhead_mps_920528 (same id, address, type Selling, same payment source)",
-      "balance": "UNMEASURED: Blockfrost 404 (address not yet on-chain) — awaiting test ADA"
+      "balance": "VERIFIED Blockfrost 200: 700000000 lovelace before registration (2026-10-07T03:22:27Z); 699553889 lovelace after (2026-10-07T03:32:34.288Z)",
+      "id": "cmuxiwa790009owvcaofhehg1",
+      "vkey": "f881392976551f70c3db23f00988c8b4779f56174cc579af92c9ebde"
     },
-    "secrets": "masumi-payment-service/.env + mps-db/.local/* (private, gitignored, never printed)"
+    "secrets": "masumi-payment-service/.env + mps-db/.local/* (private, gitignored, never printed)",
+    "purchasingWallet": {
+      "id": "cmuxiwa790008owvc4fqcegab",
+      "vkey": "de39cc77ce97f9531f828d8e4fa667cf6477babe678b52f26a92c0b9",
+      "address": "addr_test1qr0rnnrhe6tlj5cls2xcunaxvl8kgaa6henck5hjd2fvpw073tfdyz2574tg4rnazrw23t2klnd3ldlx22zdf75y7cnqpcvlyj",
+      "balance": "UNMEASURED: Blockfrost 404 at 2026-10-07T03:32:35.375Z (not on-chain yet; not zero) — needs test ADA (+ tUSDM) to buy from other agents"
+    }
   },
   "sokosumi": {
     "cli": "installed 1.0.0 (demo verified on 1.0.4)",
     "auth": "NOT SIGNED IN — run: sokosumi --preprod auth login",
     "vendor": null,
     "coworker": null
+  },
+  "masumiRegistration": {
+    "state": "RegistrationConfirmed (VERIFIED via MPS GET /registry + Blockfrost)",
+    "registryId": "cmuxjl4ij0000v4vcxwbqulbs",
+    "name": "Bulkhead Captain",
+    "type": "Standard",
+    "pricing": "Dynamic (supportedPaymentSources[0].pricing)",
+    "supportedPaymentSourceIndex": 0,
+    "agentIdentifier": "67ab0c92c4ac1610895a1c965ee50aba41a8f1513b15240723b3bd0b10d33eba055f7a8408ae351621383719ff41089f7fde1e55bb737b67c5000000",
+    "txHash": "768b226ef8dbe70045abff23a7688c969822c935fd43d95b92ba6bfbf841f223",
+    "explorer": "https://preprod.cardanoscan.io/transaction/768b226ef8dbe70045abff23a7688c969822c935fd43d95b92ba6bfbf841f223",
+    "blockHeight": 5262941,
+    "fees": "274626",
+    "apiBaseUrl": "http://127.0.0.1:4200 (loopback, not publicly reachable)",
+    "checkpoint": "apps/sokosumi-worker/.local/registration-state.json"
+  },
+  "mpsKeys": {
+    "runtime": {
+      "id": "cmuxjl84p0003v4vc5xdp8mc9",
+      "file": "apps/sokosumi-worker/.local/mps-runtime.env (MPS_RUNTIME_TOKEN, owner-only ACL)",
+      "scope": "ReadAndPay (canRead+canPay, canAdmin false), usageLimited false, Preprod only (cardano:preprod), wallet scope = Selling wallet cmuxiwa790009owvcaofhehg1",
+      "verified": "verified (api-key-status + payment-source list, HTTP 200)"
+    },
+    "buyer": {
+      "id": "cmuxjl8ed0005v4vcxrhqbopd",
+      "file": ".local/mps-buyer.env (MPS_BUYER_TOKEN, owner-only ACL)",
+      "scope": "ReadAndPay (canRead+canPay, canAdmin false), usageLimited false, Preprod only, wallet scope = Purchasing wallet cmuxiwa790008owvc4fqcegab",
+      "verified": "verified (api-key-status + payment-source list, HTTP 200)"
+    }
   }
 }
