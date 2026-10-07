@@ -1041,8 +1041,10 @@ export async function handleFixture(method: string, pathWithQuery: string, body:
   if (method === "GET" && p === "/events/stream") {
     const goalId = url.searchParams.get("goalId");
     const after = Number(url.searchParams.get("after") ?? "0") || 0;
+    // `after` present (even 0) = replay history (the Bridge replays a goal with ?goalId=…&after=0).
+    const replay = url.searchParams.has("after");
     return sse(ctx.signal, (send) => {
-      if (after) for (const e of s.events.filter((q) => q.id > after)) send(e);
+      if (replay) for (const e of s.events.filter((q) => q.id > after && (!goalId || !q.goalId || q.goalId === goalId))) send(e);
       const fn = (e: BulkheadEvent) => {
         if (!goalId || !e.goalId || e.goalId === goalId) send(e);
       };

@@ -9,6 +9,7 @@ import {
   PlannedSessionSchema,
   microToTusd,
   tusdToMicro,
+  type BulkheadEvent,
   type CaptainTool,
   type DecisionKind,
   type Handback,
@@ -16,6 +17,7 @@ import {
 import { goals, payments, sessions as sessionsT, type DB } from "@bulkhead/db";
 import { and, eq } from "drizzle-orm";
 import type { AgentMarket, DecisionLedger, Engine, EventBus, LLMToolDef, SessionManager, SessionRow } from "../contracts";
+import { cleanModelWhy, deriveWhy } from "./why";
 
 export interface CaptainToolContext {
   db: DB;
@@ -28,6 +30,10 @@ export interface CaptainToolContext {
   goalId: string | null;
   /** The event that woke the captain (recorded on each captain_action). */
   triggerEventId?: number;
+  /** The wake's events (trigger first): the evidence a deterministic `why` is derived from. */
+  wakeEvents?: BulkheadEvent[];
+  /** Wake triggers whose report_to_user is routine (record only, no push) — see captain.ts reportNotify. */
+  routineWake?: boolean;
   /** plan_task → creates a planned goal awaiting the user's "Approve & start". */
   planGoal: (req: { goal: string; budgetTUSD: string; deadline: string; rules: string }) => Promise<{ goalId: string; sessions: number; totalTusd: string }>;
 }
@@ -36,7 +42,13 @@ export type ToolOutcome = { ok: true; result: unknown } | { ok: false; error: st
 
 const sessionRef = { type: "string", description: "Session id or its letter within the current goal (e.g. \"B\")." };
 
-export const CAPTAIN_TOOL_DEFS: readonly LLMToolDef[] = [
+/** Every tool takes an optional `why`: one evidence-based sentence shown to the user next to the action. */
+const WHY_PROP = {
+  type: "string",
+  description: "One short sentence for the user: the evidence that made you act + what this does (e.g. \"B hit 4 consecutive 404s; redirecting it to docs.cardano.org\"). Cite facts from the state, never invent them.",
+};
+
+const RAW_TOOL_DEFS: readonly LLMToolDef[] = [
   {
     name: "plan_task",
     description:
@@ -137,6 +149,11 @@ export const CAPTAIN_TOOL_DEFS: readonly LLMToolDef[] = [
     input_schema: { type: "object", properties: { text: { type: "string" } }, required: ["text"], additionalProperties: false },
   },
 ];
+
+export const CAPTAIN_TOOL_DEFS: readonly LLMToolDef[] = RAW_TOOL_DEFS.map((d) => ({
+  ...d,
+  input_schema: { ...d.input_schema, properties: { ...(d.input_schema.properties as Record<string, unknown>), why: WHY_PROP } },
+}));
 
 if (CAPTAIN_TOOL_DEFS.length !== CAPTAIN_TOOLS.length || CAPTAIN_TOOL_DEFS.some((d, i) => d.name !== CAPTAIN_TOOLS[i])) {
   throw new Error("captain tool definitions out of sync with CAPTAIN_TOOLS");
@@ -252,7 +269,12 @@ async function execute(name: string, input: Record<string, unknown>, ctx: Captai
       return requestApproval(input, ctx);
     case "report_to_user": {
       const text = str(input.text, "text").slice(0, 2_000);
-      const e = ctx.bus.emit("captain_report", { goalId: ctx.goalId ?? undefined, data: { text, userId: ctx.userId, triggerEventId: ctx.triggerEventId } });
+      // notify=false: the wake was routine (e.g. a mid-goal accepted handback, a top-up the user made themselves, an
+      // approval the structured escalation report already surfaced) — recorded in the log + /ahoy, not pushed.
+      const e = ctx.bus.emit("captain_report", {
+        goalId: ctx.goalId ?? undefined,
+        data: { text, userId: ctx.userId, triggerEventId: ctx.triggerEventId, notify: !ctx.routineWake, ...(ctx.routineWake ? { routine: true } : {}) },
+      });
       return { reported: true, eventId: e.id };
     }
     default:
@@ -307,6 +329,12 @@ function requestApproval(input: Record<string, unknown>, ctx: CaptainToolContext
   if (!DECISION_KINDS.includes(kind)) throw new ToolError(`kind must be one of ${DECISION_KINDS.join(", ")}`);
   const row = resolveSession(ctx, input.sessionId);
   const reason = str(input.reason, "reason").slice(0, 500);
+  // Escalate only real decisions: nothing to decide for a session that is finishing or gone, and a quarantine
+  // release only exists while the session is quarantined (the runtime opens that one itself).
+  if (["COMPLETING", "CLOSING", "CLOSED", "FAILED", "KILLED", "EXPIRED"].includes(row.status)) {
+    throw new ToolError(`session ${row.letter} is ${row.status}; there is nothing for the user to decide`);
+  }
+  if (kind === "quarantine_release" && row.status !== "QUARANTINED") throw new ToolError(`session ${row.letter} is not quarantined`);
   const details: Record<string, unknown> = { reason, requestedVia: "captain" };
   let refKey: string;
   switch (kind) {
@@ -343,20 +371,33 @@ function requestApproval(input: Record<string, unknown>, ctx: CaptainToolContext
 }
 
 /** Execute one captain tool call, emitting `captain_action` either way. Never throws. */
-export async function runCaptainTool(name: string, input: Record<string, unknown>, ctx: CaptainToolContext, opts: { auto?: boolean } = {}): Promise<ToolOutcome> {
+export async function runCaptainTool(name: string, rawInput: Record<string, unknown>, ctx: CaptainToolContext, opts: { auto?: boolean; why?: string } = {}): Promise<ToolOutcome> {
+  // `why` is commentary for the user, never a tool argument.
+  const { why: modelWhy, ...input } = rawInput ?? {};
   let outcome: ToolOutcome;
   try {
-    outcome = { ok: true, result: await execute(name, input ?? {}, ctx) };
+    outcome = { ok: true, result: await execute(name, input, ctx) };
   } catch (err) {
     outcome = { ok: false, error: err instanceof Error ? err.message : String(err) };
   }
   const sessionRefIn = (input?.sessionId ?? input?.fromSessionId) as string | undefined;
   let sessionId: string | undefined;
+  let row: SessionRow | null = null;
   try {
-    sessionId = sessionRefIn && sessionRefIn !== "all" ? resolveSession(ctx, sessionRefIn).id : undefined;
+    row = sessionRefIn && sessionRefIn !== "all" ? resolveSession(ctx, sessionRefIn) : null;
+    sessionId = row?.id;
   } catch {
     sessionId = undefined;
   }
+  let toLetter: string | undefined;
+  try {
+    toLetter = name === "pass_handback" ? resolveSession(ctx, input.toSessionId).letter : undefined;
+  } catch {
+    toLetter = undefined;
+  }
+  const helperWhy = cleanModelWhy(opts.why); // the deterministic ladder passes its own evidence
+  const fromModel = helperWhy ? null : cleanModelWhy(modelWhy);
+  const why = helperWhy ?? fromModel ?? deriveWhy({ tool: name, input, events: ctx.wakeEvents ?? [], row, toLetter, db: ctx.db });
   ctx.bus.emit("captain_action", {
     goalId: ctx.goalId ?? undefined,
     sessionId,
@@ -369,6 +410,9 @@ export async function runCaptainTool(name: string, input: Record<string, unknown
       triggerEventId: ctx.triggerEventId,
       // auto: the deterministic helper made this move (the model did not act on an actionable signal).
       ...(opts.auto ? { auto: true } : {}),
+      // why: one evidence-based sentence (model-written, or derived from the wake's events).
+      why,
+      whySource: fromModel ? "model" : "auto",
     },
   });
   return outcome;

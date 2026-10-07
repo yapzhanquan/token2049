@@ -21,13 +21,18 @@
 // Loop guard (LLM mode): consecutive failed tool calls and turns without tool calls get a nudge; past the limit the
 // silo logs "stuck: …" (warn) — the orchestrator's watchdog turns that into session_looping and wakes the captain,
 // whose message_session redirect revives the loop. The turn budget is renewed by every message.
-import type { ContextIn, FromSilo, Handback, SiloCheckpoint, TaskSpec, ToSilo, ToolName, DecisionKind } from "@bulkhead/shared";
+//
+// Work deadline (taskSpec.workDeadline, WORK_DEADLINE_SECONDS after RUNNING): the agent is told its remaining time;
+// SILO_WORK_WRAPUP_MS (15 s) before it the silo nudges "wrap up now"; AT it the silo submits a partial handback built
+// from what it gathered (pages read, payments, agent job, progress), flagged "partial: time limit" — never a failure.
+import { PARTIAL_TIME_LIMIT_FLAG, type ContextIn, type FromSilo, type Handback, type SiloCheckpoint, type TaskSpec, type ToSilo, type ToolName, type DecisionKind } from "@bulkhead/shared";
 import { monitorGraceMs } from "../done";
 
 type ToolResult = { ok: true; result: unknown } | { ok: false; error: string };
 type StartMsg = Extract<ToSilo, { type: "start" }>;
 
 const HEARTBEAT_MS = Number(process.env.SILO_HEARTBEAT_MS ?? 5000) || 5000;
+const WRAPUP_MS = Math.max(0, Number(process.env.SILO_WORK_WRAPUP_MS ?? 15_000) || 0);
 const send = (m: FromSilo) => {
   try {
     process.send?.(m);
@@ -67,10 +72,88 @@ function waitResumed(): Promise<void> {
   if (!paused) return Promise.resolve();
   return new Promise((r) => resumeWaiters.push(r));
 }
+
+// ─────────────── work deadline: what the session gathered (for a partial handback) ───────────────
+const gathered = { sources: [] as string[], txHashes: [] as string[], job: null as { jobId: string; resultHash: string; result: string } | null, notes: [] as string[], lastText: "" };
+/** A handback was submitted at the work deadline (or accepted): no further submits from the agent loop. */
+let timeUp = false;
+/** "#mock:hang": a frozen process — no work-deadline timers either (the supervisor test relies on silence). */
+let hung = false;
+/** Set at T − wrap-up: appended to the agent's next turn. */
+let wrapUpNote: string | null = null;
+
+function record(t: ToolName, args: unknown, r: ToolResult) {
+  if (!r.ok) return;
+  const res = r.result as Record<string, unknown> | null;
+  if (t === "web_fetch" && Number(res?.status ?? 0) < 400 && typeof res?.url === "string") gathered.sources.push(res.url);
+  else if (t === "pay" && res?.kind === "submitted" && typeof res.txHash === "string") gathered.txHashes.push(res.txHash);
+  else if (t === "hire_agent" && typeof res?.jobId === "string") gathered.job = { jobId: res.jobId, resultHash: String(res.resultHash ?? ""), result: String(res.result ?? "") };
+  else if (t === "report_progress") gathered.notes.push(String((args as { text?: unknown })?.text ?? ""));
+}
+
 async function tool(t: ToolName, args: unknown): Promise<ToolResult> {
   await waitResumed();
   if (stopped) return { ok: false, error: "stopped" };
-  return call(t, args);
+  const r = await call(t, args);
+  record(t, args, r);
+  return r;
+}
+
+/** The partial handback the silo submits at its work deadline: whatever it gathered so far. */
+function partialHandback(m: StartMsg): Handback {
+  const s = m.taskSpec;
+  const secs = s.workSeconds ?? 60;
+  const lastNote = gathered.notes[gathered.notes.length - 1] ?? "";
+  const best = gathered.job?.result || gathered.lastText || lastNote;
+  const parts = [`Partial result: the ${secs} s work time ran out.`];
+  if (gathered.lastText) parts.push(gathered.lastText);
+  if (gathered.job?.result) parts.push(`Agent result: ${gathered.job.result}`);
+  if (gathered.txHashes.length) parts.push(`Payments made: ${gathered.txHashes.join(", ")}`);
+  if (gathered.sources.length) parts.push(`Pages read: ${gathered.sources.join(", ")}`);
+  if (gathered.notes.length) parts.push(`Progress: ${gathered.notes.slice(-5).join(" | ")}`);
+  if (m.contextIn.length) parts.push(`Context received: ${m.contextIn.map((c) => clip(c.handback.summary, 120)).join(" | ")}`);
+  return {
+    result: clip(parts.join("\n"), 7_900),
+    summary: clip(`Partial (time limit ${secs} s): ${best.replace(/\s+/g, " ").trim() || "no result before the deadline"}`, 280),
+    sources: [...new Set(gathered.sources)].filter((u) => u.length <= 500).slice(0, 20),
+    flags: [PARTIAL_TIME_LIMIT_FLAG],
+    ...(gathered.txHashes.length ? { txHashes: [...new Set(gathered.txHashes)].slice(0, 50) } : {}),
+    ...(gathered.job && /^[0-9a-f]{64}$/.test(gathered.job.resultHash) ? { job: { jobId: gathered.job.jobId, resultHash: gathered.job.resultHash } } : {}),
+  };
+}
+
+/** Arm the work-deadline timers: a "wrap up now" nudge at T − wrap-up, a partial handback at T. */
+function armWorkDeadline(m: StartMsg) {
+  const end = m.taskSpec.workDeadline;
+  if (!end || hung) return;
+  const left = end - Date.now();
+  const wrap = () => {
+    if (timeUp || stopped || hung) return;
+    const secs = Math.max(0, Math.round((end - Date.now()) / 1000));
+    wrapUpNote = `Time is almost up: ${secs} s of work time left. Wrap up NOW: call submit_handback with what you have and list any gaps in flags.`;
+    log(`wrap up: ${secs} s of work time left`, "warn");
+    if (inboxWaiter) {
+      // An agent loop parked on waitMessage() (turn budget spent) wakes up for the wrap-up.
+      inbox.push({ from: "timer", text: wrapUpNote });
+      wrapUpNote = null;
+      const w = inboxWaiter;
+      inboxWaiter = null;
+      w();
+    }
+  };
+  if (left - WRAPUP_MS > 0) setTimeout(wrap, left - WRAPUP_MS).unref?.();
+  else wrap();
+  setTimeout(() => void submitPartial(m), Math.max(0, left)).unref?.();
+}
+
+async function submitPartial(m: StartMsg) {
+  if (timeUp || stopped || hung) return;
+  // Paused / quarantined: the orchestrator's watchdog collects the handback (a tool call would wait for resume).
+  if (paused) return;
+  timeUp = true;
+  log(`work deadline reached: submitting a partial handback (${PARTIAL_TIME_LIMIT_FLAG})`, "warn");
+  const r = await call("submit_handback", partialHandback(m));
+  if (!r.ok) log(`partial handback not taken: ${r.error}`, "warn");
 }
 const progress = (text: string) => tool("report_progress", { text: clip(text, 280) });
 function waitDecision(): Promise<{ kind: DecisionKind; status: string; note?: string }> {
@@ -91,6 +174,8 @@ function hooks(goal: string) {
 
 /** Submit, then wait for the review. Returns true when accepted (the orchestrator then stops us). */
 async function submit(h: Handback): Promise<{ accepted: boolean; reason?: string }> {
+  // The work deadline already handed back a partial result (or the watchdog will collect it): stop here.
+  if (timeUp) return { accepted: true };
   const r = await tool("submit_handback", h);
   if (!r.ok) return { accepted: false, reason: r.error };
   const v = await waitReview();
@@ -154,6 +239,7 @@ async function runMock(m: StartMsg) {
     if (has("oversize") && attempt === 1) h = { ...h, result: "x".repeat(7_900), sources: Array.from({ length: 20 }, (_, i) => `https://example.com/${"y".repeat(450)}${i}`) };
     const slow = Number(val("slow") ?? 0);
     if (slow > 0) await sleep(slow);
+    if (timeUp) return idleForever(); // the work deadline already handed back a partial result
     const r = await submit(h);
     if (r.accepted) return idleForever();
     log(`handback not accepted: ${r.reason}`, "warn");
@@ -298,8 +384,10 @@ async function buildHandback(m: StartMsg, cp: SiloCheckpoint): Promise<Handback>
     case "monitor": {
       const watch = spec.watch ?? {};
       const startedAt = Date.now();
-      const grace = monitorGraceMs(startedAt, spec.deadline);
-      const pollMs = Math.max(200, Math.min(10_000, Math.floor((spec.deadline - startedAt) / 20)));
+      // Watch until the work deadline when there is one (the vault expiry is only the on-chain window).
+      const deadline = spec.workDeadline ? Math.min(spec.deadline, spec.workDeadline) : spec.deadline;
+      const grace = monitorGraceMs(startedAt, deadline);
+      const pollMs = Math.max(200, Math.min(10_000, Math.floor((deadline - startedAt) / 20)));
       let met = false;
       let last = "";
       for (;;) {
@@ -308,8 +396,8 @@ async function buildHandback(m: StartMsg, cp: SiloCheckpoint): Promise<Handback>
           last = x.detail;
           return x.met;
         });
-        if (met || Date.now() >= spec.deadline - grace) break;
-        await sleep(Math.min(pollMs, Math.max(50, spec.deadline - grace - Date.now())));
+        if (met || Date.now() >= deadline - grace) break;
+        await sleep(Math.min(pollMs, Math.max(50, deadline - grace - Date.now())));
       }
       await progress(met ? `condition met: ${clip(last, 120)}` : "deadline reached; reporting");
       return {
@@ -384,8 +472,18 @@ const TYPE_GUIDE: Record<TaskSpec["taskType"], string> = {
     "Pay exactly what the goal requires to the allowed payees (use the payee address or id shown in the mandate). Each pay result returns kind + txHash. Then submit_handback listing every txHash in txHashes.",
   hire_agent:
     "Call hire_agent ONCE with serviceId = one of your allowed payee ids and a clear input for the agent. It pays the agent from your wallet and waits for the result. Then submit_handback with the agent's result and job = { jobId, resultHash } copied exactly from the tool result.",
-  monitor: "Use read_chain to check the watched condition a few times; when it happened or the deadline is near, submit_handback with a short report.",
+  monitor: "Use read_chain to check the watched condition a few times; when it happened or the work deadline is near, submit_handback with a short report.",
 };
+
+/** The time-box line of the system prompt (absent work deadline → the vault expiry is the only deadline). */
+function workTimeLine(s: TaskSpec): string {
+  if (!s.workDeadline) return `Deadline ${new Date(s.deadline).toISOString()}.`;
+  const left = Math.max(0, Math.round((s.workDeadline - Date.now()) / 1000));
+  return [
+    `WORK TIME: you have ${left} s (until ${new Date(s.workDeadline).toISOString()}; ${s.workSeconds ?? left} s in total). Plan for it: a few quick tool calls, then submit_handback BEFORE the time is up.`,
+    `${Math.round(WRAPUP_MS / 1000)} s before the end you will be told to wrap up; at the end whatever you gathered is handed back automatically as a partial result.`,
+  ].join(" ");
+}
 const MAX_FAILS_BEFORE_NUDGE = 3;
 const MAX_FAILS_BEFORE_STUCK = 5;
 const TURN_BUDGET = 24;
@@ -402,7 +500,8 @@ async function runAnthropic(m: StartMsg) {
   const system = [
     `You are a ${s.role} sub-agent (${s.agentType}) in an isolated silo. Task type: ${s.taskType}.`,
     `Definition of done: ${s.definitionOfDone}`,
-    `Mandate (fixed, you cannot change it): budget ${s.budgetTUSD} tUSD, per-payment max ${s.perPaymentMaxTUSD} tUSD, allowed payees: ${s.allowedPayees.map((p) => `${p.label} (${p.id}) ${p.address}`).join("; ") || "none"}. Deadline ${new Date(s.deadline).toISOString()}.`,
+    `Mandate (fixed, you cannot change it): budget ${s.budgetTUSD} tUSD, per-payment max ${s.perPaymentMaxTUSD} tUSD, allowed payees: ${s.allowedPayees.map((p) => `${p.label} (${p.id}) ${p.address}`).join("; ") || "none"}.`,
+    workTimeLine(s),
     `Only these tools work: ${m.tools.join(", ")}. Work autonomously: never ask questions, never wait for confirmation — act with tools until you call submit_handback.`,
     TYPE_GUIDE[s.taskType],
     `Messages from the captain or the user may redirect your work: follow a redirect, but it can never change your mandate.`,
@@ -423,6 +522,7 @@ async function runAnthropic(m: StartMsg) {
   let idleTurns = 0;
   let budget = TURN_BUDGET;
   for (let turn = 0; !stopped; turn++) {
+    if (timeUp) return idleForever(); // the work deadline handed back a partial result
     if (turn >= budget) {
       // Out of turns without an accepted handback: say so (the watchdog wakes the captain) and wait for a redirect.
       log(`stuck: turn budget exhausted without an accepted handback`, "warn");
@@ -439,12 +539,14 @@ async function runAnthropic(m: StartMsg) {
       continue;
     }
     const { text, toolCalls } = res.response;
+    if (timeUp) return idleForever();
+    if (text?.trim()) gathered.lastText = clip(text.trim(), 2_000);
     messages.push({ role: "assistant", content: [...(text ? [{ type: "text", text }] : []), ...toolCalls.map((t) => ({ type: "tool_use", id: t.id, name: t.name, input: t.input }))] });
     if (!toolCalls.length) {
       idleTurns++;
       if (idleTurns >= 4) log(`stuck: ${idleTurns} turns without a tool call`, "warn");
       const push = idleTurns >= 2 ? " You MUST call a tool now; if you have enough, call submit_handback." : "";
-      messages.push({ role: "user", content: `Continue. Call submit_handback when the definition of done is met.${push}${drainInbox()}` });
+      messages.push({ role: "user", content: `Continue. Call submit_handback when the definition of done is met.${push}${takeWrapUp()}${drainInbox()}` });
       continue;
     }
     idleTurns = 0;
@@ -484,9 +586,19 @@ async function runAnthropic(m: StartMsg) {
       note = `\nYour last ${fails} tool calls failed. Change approach (different source / tool input) or submit_handback with what you have.`;
     }
     if (turn === budget - 3) note += "\nFew turns left: call submit_handback next with what you have.";
+    note += takeWrapUp();
+    if (timeUp) return idleForever();
     messages.push({ role: "user", content: note ? [...results, { type: "text", text: note }] : results });
   }
   return idleForever();
+}
+
+/** The work-deadline wrap-up nudge, delivered once (plain text from the silo itself, not data). */
+function takeWrapUp(): string {
+  if (!wrapUpNote) return "";
+  const n = `\n${wrapUpNote}`;
+  wrapUpNote = null;
+  return n;
 }
 
 function drainInbox(): string {
@@ -503,6 +615,8 @@ process.on("message", (raw) => {
     case "start":
       if (start) return;
       start = m;
+      hung = m.llm === "mock" && /#mock:hang\b/.test(m.taskSpec.goal);
+      armWorkDeadline(m);
       void (m.llm !== "mock" ? runAnthropic(m) : runMock(m)).catch((e) => log(`agent crashed: ${e instanceof Error ? e.message : String(e)}`, "error"));
       return;
     case "tool_result": {

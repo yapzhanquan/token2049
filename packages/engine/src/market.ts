@@ -56,7 +56,7 @@ export function createAgentMarket(opts: { baseUrl: string; fetchImpl?: FetchFn; 
   return market;
 }
 
-/** Sokosumi adapter placeholder (stretch goal, spec §5.6): not configured in this build. */
+/** Legacy placeholder (unused). The real Sokosumi market is market-sokosumi.ts (MARKET=sokosumi). */
 export class SokosumiMarket implements AgentMarket {
   async catalog(): Promise<AgentCatalogEntry[]> {
     throw new Error("SokosumiMarket: not configured");

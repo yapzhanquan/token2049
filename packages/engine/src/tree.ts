@@ -2,7 +2,7 @@
 // muted "ghost" nodes that keep their handback summary, spend, refund and close-tx link.
 import { and, asc, eq, inArray } from "drizzle-orm";
 import { agentJobs, decisions, events, goals, sessions, type DB } from "@bulkhead/db";
-import { glyphFor, microToMyr, type Glyph, type SessionStatus, type TaskType, type TreeDTO, type TreeEdge, type TreeNode } from "@bulkhead/shared";
+import { TIMEBOXED_CLOSE_STATUS, glyphFor, microToMyr, type Glyph, type SessionStatus, type TaskType, type TreeDTO, type TreeEdge, type TreeNode } from "@bulkhead/shared";
 
 const ENDED: SessionStatus[] = ["FAILED", "KILLED", "EXPIRED"];
 
@@ -17,7 +17,8 @@ function fmtLeft(ms: number): string {
 }
 const clip = (s: string, n = 80) => (s.length > n ? `${s.slice(0, n - 1)}…` : s);
 
-export function buildTree(db: DB, goalId: string, opts: { myrPerTusd: string; now: number }): TreeDTO {
+/** opts.workDeadlineMs (WORK_DEADLINE_SECONDS × 1000, 0/absent = none): running sessions show their work time left. */
+export function buildTree(db: DB, goalId: string, opts: { myrPerTusd: string; now: number; workDeadlineMs?: number }): TreeDTO {
   const goal = db.select().from(goals).where(eq(goals.id, goalId)).get();
   if (!goal) throw new Error(`goal ${goalId} not found`);
   const rows = db.select().from(sessions).where(eq(sessions.goalId, goalId)).orderBy(asc(sessions.createdAt), asc(sessions.letter)).all();
@@ -77,7 +78,9 @@ export function buildTree(db: DB, goalId: string, opts: { myrPerTusd: string; no
   for (const r of rows) {
     const status = r.status as SessionStatus;
     const closeStatus = (r.closeStatus ?? null) as string | null;
-    const endedBadly = ENDED.includes(status) || ((status === "CLOSED" || status === "CLOSING") && closeStatus !== null && closeStatus !== "COMPLETED");
+    // TIMEBOXED (work deadline reached; partial handback kept) is not a failure: it shows its partial summary.
+    const endedBadly = ENDED.includes(status) || ((status === "CLOSED" || status === "CLOSING") && closeStatus !== null && closeStatus !== "COMPLETED" && closeStatus !== TIMEBOXED_CLOSE_STATUS);
+    const workDeadlineAt = opts.workDeadlineMs && opts.workDeadlineMs > 0 && r.startedAt ? r.startedAt + opts.workDeadlineMs : undefined;
     const ghost = status === "CLOSED" || status === "CLOSING" || ENDED.includes(status);
     const dec = openDec.get(r.id);
     const glyph: Glyph = endedBadly ? "failed" : glyphFor(status, (dec?.payments ?? 0) > 0);
@@ -95,7 +98,8 @@ export function buildTree(db: DB, goalId: string, opts: { myrPerTusd: string; no
       lines = [clip(first), `${rm(budget)} budget · ${fmtLeft(r.expiresAt - opts.now)}`];
     } else {
       const rejection = status === "QUARANTINED" ? "quarantined: awaiting your review" : undefined;
-      lines = [clip(rejection ?? latest.get(r.id) ?? "starting…"), `${rm(budget - spent)} of ${rm(budget)} left · ${fmtLeft(r.expiresAt - opts.now)}`];
+      const left = workDeadlineAt !== undefined ? `work ${fmtLeft(workDeadlineAt - opts.now).replace("expired", "time up")}` : fmtLeft(r.expiresAt - opts.now);
+      lines = [clip(rejection ?? latest.get(r.id) ?? "starting…"), `${rm(budget - spent)} of ${rm(budget)} left · ${left}`];
     }
     const parentId = r.parentSessionId && ids.includes(r.parentSessionId) ? r.parentSessionId : goal.id;
     nodes.push({
@@ -111,6 +115,7 @@ export function buildTree(db: DB, goalId: string, opts: { myrPerTusd: string; no
       lines,
       ...(r.startedAt ? { startedAt: r.startedAt } : {}),
       ...(r.endedAt ? { endedAt: r.endedAt } : {}),
+      ...(workDeadlineAt !== undefined ? { workDeadlineAt } : {}),
       tokensUsed: r.tokensUsed,
       spentMicro: r.spentMicro,
       budgetMicro: r.budgetMicro,

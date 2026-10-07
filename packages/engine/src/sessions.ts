@@ -7,8 +7,12 @@ import type { Chain } from "@bulkhead/chain";
 import {
   ENDING_STATUSES,
   MAX_DONE_ATTEMPTS,
+  HandbackSchema,
   MandateSchema,
+  PARTIAL_TIME_LIMIT_FLAG,
+  TIMEBOXED_CLOSE_STATUS,
   TRANSITIONS,
+  isTimeLimitPartial,
   microToTusd,
   tusdToMicro,
   type ContextIn,
@@ -23,18 +27,21 @@ import type { RuntimeDecisionLedger } from "./decisions";
 import type { RuntimeSigner } from "./signer";
 import type { RuntimeSiloRunner } from "./silo/runner";
 import { checkDone, evaluateWatch } from "./done";
+import { isSokosumiCreditPayment } from "./market-sokosumi";
 import { buildTree } from "./tree";
 import { toJson } from "./bus";
 import {
   ACTIVE_STATUSES,
   getSessionDb,
   keyedMutex,
+  minVaultExpiry,
   newId,
   sha256Hex,
   sleep,
   toSessionRow,
   updateSessionDb,
   waitForTx,
+  workDeadlineOf,
   type RuntimeConfig,
   type SessionDbRow,
 } from "./sessions-store";
@@ -68,6 +75,10 @@ export interface RuntimeSessionManager extends SessionManager {
   transitionsOf(sessionId: string): (typeof transitions.$inferSelect)[];
   /** Stop timers / pending loops (tests, shutdown). Does not touch sessions. */
   shutdown(): Promise<void>;
+  /** The session's work deadline (startedAt + WORK_DEADLINE_SECONDS); null before RUNNING or when disabled. */
+  workDeadlineOf(sessionId: string): number | null;
+  /** Work deadline reached: collect a partial handback (from what the session recorded) and close it. */
+  timeBox(sessionId: string, reason: string): Promise<boolean>;
 }
 
 export interface SessionManagerDeps {
@@ -233,6 +244,51 @@ export function wrapHandback(h: Handback, meta: { fromSessionId: string; tainted
   ].join("\n");
 }
 
+/**
+ * Which "wave" each planned session starts in: 0 = right after funding; a session with contextFrom / parent waits
+ * for those (1 + their wave); sessions beyond MAX_PARALLEL_SESSIONS queue for a free slot. Used for the minimal
+ * vault expiry (each wave adds one work deadline). Exported for tests.
+ */
+export function planWaves(specs: Pick<PlannedSession, "contextFrom" | "parent">[], maxParallel: number): number[] {
+  const depth: number[] = [];
+  specs.forEach((s, i) => {
+    const deps = [...(s.contextFrom ?? []), ...(s.parent !== undefined ? [s.parent] : [])].filter((d) => d >= 0 && d < i);
+    depth[i] = deps.length ? 1 + Math.max(...deps.map((d) => depth[d] ?? 0)) : 0;
+  });
+  const per = Math.max(1, maxParallel);
+  return depth.map((d, i) => d + Math.floor(i / per));
+}
+
+/**
+ * The partial handback the orchestrator collects when a session's work time ran out and its silo did not hand
+ * back (watchdog backstop): what the session recorded — last progress line, URLs it read, payments it made, agent
+ * jobs that delivered. Flagged PARTIAL_TIME_LIMIT_FLAG. Exported for tests.
+ */
+export function partialHandbackFrom(a: {
+  taskType: string;
+  lastProgress?: string | null;
+  sources: string[];
+  txHashes: string[];
+  job?: { jobId: string; resultHash: string; result: string } | null;
+  workSeconds: number;
+}): Handback {
+  const clip = (s: string, n: number) => (s.length > n ? `${s.slice(0, n - 1)}…` : s);
+  const parts = [`Partial result: the ${a.workSeconds} s work time ran out before the ${a.taskType} sub-agent handed back.`];
+  if (a.lastProgress) parts.push(`Last progress: ${a.lastProgress}`);
+  if (a.job?.result) parts.push(`Agent result: ${a.job.result}`);
+  if (a.txHashes.length) parts.push(`Payments made: ${a.txHashes.join(", ")}`);
+  if (a.sources.length) parts.push(`Pages read: ${a.sources.join(", ")}`);
+  const raw = {
+    result: clip(parts.join("\n"), 7_900),
+    summary: clip(`Partial (time limit ${a.workSeconds} s): ${a.job?.result ? a.job.result.replace(/\s+/g, " ") : (a.lastProgress ?? "no result before the deadline")}`, 280),
+    sources: [...new Set(a.sources)].filter((u) => u.length <= 500).slice(0, 20),
+    flags: [PARTIAL_TIME_LIMIT_FLAG, "collected by the captain's watchdog (no handback from the sub-agent in time)"],
+    ...(a.txHashes.length ? { txHashes: [...new Set(a.txHashes)].filter((t) => /^[0-9a-f]{64}$/.test(t)).slice(0, 50) } : {}),
+    ...(a.job ? { job: { jobId: a.job.jobId, resultHash: a.job.resultHash } } : {}),
+  };
+  return HandbackSchema.parse(raw);
+}
+
 const LETTERS = (i: number): string => {
   let s = "";
   let n = i;
@@ -255,6 +311,8 @@ export function createSessionManager(deps: SessionManagerDeps): RuntimeSessionMa
   /** Sessions whose funding tx is being built / signed / submitted right now (never funded twice concurrently). */
   const fundingNow = new Set<string>();
   const watchingFunding = new Set<string>();
+  /** closeStatus to record on the next → CLOSING (a time-boxed partial handback: TIMEBOXED instead of COMPLETED). */
+  const closeStatusOverride = new Map<string, string>();
 
   const must = (id: string): SessionDbRow => {
     const r = getSessionDb(db, id);
@@ -344,11 +402,16 @@ export function createSessionManager(deps: SessionManagerDeps): RuntimeSessionMa
         out.push({ id: r.handle, label: r.handle, address: r.address, handle: r.handle, resolvedAt: r.resolvedAt });
         continue;
       }
-      if (/^masumi:/.test(p)) {
-        // Market payee alias (MARKET=masumi: "masumi:purchasing-wallet" → Bulkhead's MPS purchasing wallet).
-        const r = market.resolvePayeeAlias ? await market.resolvePayeeAlias(p).catch((e) => (bus.emit("error", { goalId, data: { kind: "market_unreachable", error: err(e) } }), null)) : null;
+      if (/^(masumi|sokosumi):/.test(p)) {
+        // Market payee alias (MARKET=masumi: "masumi:purchasing-wallet" → Bulkhead's MPS purchasing wallet;
+        // MARKET=…sokosumi: "sokosumi:<agent id>" → off-chain credits, allowlisted as the owner's own treasury).
+        const ownerAddress = (() => {
+          const g = db.select({ u: goals.userId }).from(goals).where(eq(goals.id, goalId)).get();
+          return g ? db.select({ a: users.treasuryAddress }).from(users).where(eq(users.id, g.u)).get()?.a : undefined;
+        })();
+        const r = market.resolvePayeeAlias ? await market.resolvePayeeAlias(p, ownerAddress ? { ownerAddress } : undefined).catch((e) => (bus.emit("error", { goalId, data: { kind: "market_unreachable", error: err(e) } }), null)) : null;
         if (r && /^addr_test1[0-9a-z]+$/.test(r.address)) out.push(r);
-        else bus.emit("error", { goalId, data: { kind: "payee_unresolved", payee: p, error: "market payee alias not available (MARKET=masumi?)" } });
+        else bus.emit("error", { goalId, data: { kind: "payee_unresolved", payee: p, error: "market payee alias not available (MARKET=masumi / MARKET=sokosumi?)" } });
         continue;
       }
       if (/^addr_test1[0-9a-z]+$/.test(p)) {
@@ -388,11 +451,32 @@ export function createSessionManager(deps: SessionManagerDeps): RuntimeSessionMa
 
   /** Row creation is serialised engine-wide: letters (per goal) and BIP32 key indexes (global) are allocated from
    * the current max, so parallel spawns must not interleave. */
-  function createSessionRows(goalId: string, items: { spec: PlannedSession; parentSessionId: string | null; contextFrom: string[] }[]): Promise<string[]> {
+  type RowItem = { spec: PlannedSession; parentSessionId: string | null; contextFrom: string[]; wave?: number };
+  function createSessionRows(goalId: string, items: RowItem[]): Promise<string[]> {
     return lock("__create_rows__", () => createSessionRowsLocked(goalId, items));
   }
 
-  async function createSessionRowsLocked(goalId: string, items: { spec: PlannedSession; parentSessionId: string | null; contextFrom: string[] }[]): Promise<string[]> {
+  /**
+   * The session wallet's expiry. With a work deadline (WORK_DEADLINE_SECONDS > 0) the on-chain window is kept
+   * minimal-but-valid: funding allowance + the work of its wave + the Pay/close buffer — never shorter (raised when
+   * the planned deadline is closer) and not left at a far goal deadline either (the sweep happens at the work
+   * deadline anyway). Without a work deadline the planned deadline is used as before.
+   */
+  function vaultExpiryFor(spec: PlannedSession, wave: number, goalId: string): number {
+    const asked = Date.parse(spec.deadline);
+    if (!Number.isFinite(asked) || asked <= now()) throw new Error(`session "${spec.name}": deadline must be a future ISO timestamp`);
+    if (config.workDeadlineMs <= 0) return asked;
+    const minimal = minVaultExpiry(now(), config, wave);
+    if (asked < minimal) {
+      bus.emit("progress", {
+        goalId,
+        data: { kind: "log", level: "info", text: `session "${spec.name}": wallet expiry raised to ${new Date(minimal).toISOString()} (work ${Math.round(config.workDeadlineMs / 1000)} s + funding / Pay / close confirmation windows)` },
+      });
+    }
+    return minimal;
+  }
+
+  async function createSessionRowsLocked(goalId: string, items: RowItem[]): Promise<string[]> {
     const goal = db.select().from(goals).where(eq(goals.id, goalId)).get();
     if (!goal) throw new Error(`goal ${goalId} not found`);
     const user = userOf(goal.userId);
@@ -406,10 +490,9 @@ export function createSessionManager(deps: SessionManagerDeps): RuntimeSessionMa
     const adaAllowance = walletMode === "vault" ? await currentAdaAllowance() : 0n;
     const ids: string[] = [];
     for (let i = 0; i < items.length; i++) {
-      const { spec, parentSessionId, contextFrom } = items[i]!;
+      const { spec, parentSessionId, contextFrom, wave } = items[i]!;
       const id = newId("ses");
-      const expiresAt = Date.parse(spec.deadline);
-      if (!Number.isFinite(expiresAt) || expiresAt <= now()) throw new Error(`session "${spec.name}": deadline must be a future ISO timestamp`);
+      const expiresAt = vaultExpiryFor(spec, wave ?? (contextFrom.length ? 1 : 0), goalId);
       const allowedPayees = await resolvePayees(spec.allowedPayees, goalId);
       const mandate = MandateSchema.parse({
         budgetMicro: tusdToMicro(spec.budgetTUSD),
@@ -693,7 +776,8 @@ export function createSessionManager(deps: SessionManagerDeps): RuntimeSessionMa
     const user = userOf(r.userId);
     let res;
     try {
-      const metadata674 = { session_id: id, log_sha256: r.logSha256!, handback_sha256: r.handbackSha256!, status: r.closeStatus ?? "CLOSED" };
+      // CIP-20 674: session id + goal id + sha256(utf8(handback text)) → the result is tamper-evident on-chain.
+      const metadata674 = { session_id: id, log_sha256: r.logSha256!, handback_sha256: r.handbackSha256!, status: r.closeStatus ?? "CLOSED", goal_id: r.goalId };
       // Vault: the captain's Revoke (full sweep to the owner address, enforced by the validator).
       res =
         r.walletMode === "vault"
@@ -774,7 +858,7 @@ export function createSessionManager(deps: SessionManagerDeps): RuntimeSessionMa
       const revoke = await vault.revoke({
         sessionId: id,
         toAddress: user.treasuryAddress,
-        metadata674: { session_id: id, log_sha256: sha256Hex(toJson(bus.since(0, { sessionId: id }))), handback_sha256: sha256Hex(""), status: "ROTATED" },
+        metadata674: { session_id: id, log_sha256: sha256Hex(toJson(bus.since(0, { sessionId: id }))), handback_sha256: sha256Hex(""), status: "ROTATED", goal_id: r.goalId },
       });
       bus.emit("session_funded", { goalId: r.goalId, sessionId: id, data: { phase: "rotate_revoked", txHash: revoke.txHash, oldAddress: r.address, newAddress: next.address, decisionId, why } });
       if (!(await wait(revoke.txHash))) throw new Error(`revoke tx ${revoke.txHash} not confirmed in time`);
@@ -811,7 +895,8 @@ export function createSessionManager(deps: SessionManagerDeps): RuntimeSessionMa
         return prior.map((r) => r.id);
       }
       const ids: string[] = [];
-      const items = plan.sessions.map((spec) => ({ spec, parentSessionId: null as string | null, contextFrom: [] as string[] }));
+      const waves = planWaves(plan.sessions, config.maxParallelSessions);
+      const items = plan.sessions.map((spec, i) => ({ spec, parentSessionId: null as string | null, contextFrom: [] as string[], wave: waves[i] ?? 0 }));
       // Parents and contextFrom are indexes into plan.sessions → resolve after ids exist.
       const created = await createSessionRows(goalId, items);
       ids.push(...created);
@@ -887,7 +972,10 @@ export function createSessionManager(deps: SessionManagerDeps): RuntimeSessionMa
       if (to === "RUNNING" && !r.startedAt) patch.startedAt = t;
       if (to === "CLOSED") patch.endedAt = t;
       if (ENDING_STATUSES.includes(to)) patch.endReason = reason;
-      if (to === "CLOSING") patch.closeStatus = from === "COMPLETING" ? "COMPLETED" : from;
+      if (to === "CLOSING") {
+        patch.closeStatus = closeStatusOverride.get(id) ?? (from === "COMPLETING" ? "COMPLETED" : from);
+        closeStatusOverride.delete(id);
+      }
       updateSessionDb(db, id, patch, t);
       recordTransition(id, from, to, reason);
       bus.emit("session_transition", { goalId: r.goalId, sessionId: id, data: { from, to, reason, letter: r.letter } });
@@ -1037,7 +1125,7 @@ export function createSessionManager(deps: SessionManagerDeps): RuntimeSessionMa
             sessionId: id,
             signer: "captain",
             toAddress: script.address,
-            metadata674: { session_id: id, log_sha256: sha256Hex(toJson(bus.since(0, { sessionId: id }))), handback_sha256: sha256Hex(""), status: "EXTENDED" },
+            metadata674: { session_id: id, log_sha256: sha256Hex(toJson(bus.since(0, { sessionId: id }))), handback_sha256: sha256Hex(""), status: "EXTENDED", goal_id: r.goalId },
           });
           bus.emit("session_funded", { goalId: r.goalId, sessionId: id, data: { phase: "extend_submitted", txHash: res.txHash, oldAddress: r.address, newAddress: script.address, newExpiresAt, decisionId } });
           const ok = await waitForTx(chain, res.txHash, { timeoutMs: config.txConfirmTimeoutMs, pollMs: config.txPollMs });
@@ -1137,21 +1225,27 @@ export function createSessionManager(deps: SessionManagerDeps): RuntimeSessionMa
       return lock(`review:${id}`, async () => {
         const r0 = must(id);
         if (r0.status !== "COMPLETING") {
-          return reviews.get(id) ?? (r0.closeStatus === "COMPLETED" ? { accepted: true } : { accepted: false, reason: `session is ${r0.status}` });
+          return reviews.get(id) ?? (r0.closeStatus === "COMPLETED" || r0.closeStatus === TIMEBOXED_CLOSE_STATUS ? { accepted: true } : { accepted: false, reason: `session is ${r0.status}` });
         }
         if (!r0.handbackJson) return { accepted: false, reason: "no handback submitted" };
         const handback = JSON.parse(r0.handbackJson) as Handback;
+        // Time-boxed: a partial handback (flagged at the work deadline) or any handback once the work time is over.
+        // It is judged as-is (no retry, no long confirmation wait) and closes either way.
+        const workEnd = workDeadlineOf(r0, config);
+        const timeBoxed = isTimeLimitPartial(handback) || (workEnd !== null && now() >= workEnd);
         // Wait (bounded) for this session's submitted payments to confirm before judging.
         const subs = db.select().from(payments).where(and(eq(payments.sessionId, id), isNotNull(payments.txHash))).all();
         const confirmed = new Set(subs.filter((p) => p.status === "confirmed").map((p) => p.id));
+        const confirmWaitMs = timeBoxed ? Math.min(config.doneConfirmWaitMs, 2_000) : config.doneConfirmWaitMs;
         await Promise.all(
           subs
             .filter((p) => p.status === "submitted")
             .map(async (p) => {
-              if (await waitForTx(chain, p.txHash!, { timeoutMs: config.doneConfirmWaitMs, pollMs: config.txPollMs })) confirmed.add(p.id);
+              if (await waitForTx(chain, p.txHash!, { timeoutMs: confirmWaitMs, pollMs: config.txPollMs })) confirmed.add(p.id);
             }),
         );
         const jobs = db.select().from(agentJobs).where(eq(agentJobs.sessionId, id)).all();
+        const creditRows = new Map(db.select().from(payments).where(eq(payments.sessionId, id)).all().filter(isSokosumiCreditPayment).map((p) => [p.id, p]));
         const conditionMet = r0.taskType === "monitor" ? await evaluateWatch(chain, r0.watchJson ? JSON.parse(r0.watchJson) : null) : undefined;
         const r = must(id);
         if (r.status !== "COMPLETING") return { accepted: false, reason: `session became ${r.status} during review` };
@@ -1159,17 +1253,33 @@ export function createSessionManager(deps: SessionManagerDeps): RuntimeSessionMa
           taskType: r.taskType as SessionRow["taskType"],
           handback,
           payments: subs.map((p) => ({ id: p.id, status: confirmed.has(p.id) ? "confirmed" : p.status, txHash: p.txHash })),
-          jobs: jobs.map((j) => ({ externalJobId: j.externalJobId, status: j.status, resultHash: j.resultHash, paymentConfirmed: !!j.paymentId && confirmed.has(j.paymentId) })),
+          jobs: jobs.map((j) => {
+            // Off-chain Sokosumi credit charge (market-sokosumi.ts): a confirmed row with no tx hash.
+            const credit = j.paymentId ? creditRows.get(j.paymentId) : undefined;
+            return credit
+              ? { externalJobId: j.externalJobId, status: j.status, resultHash: j.resultHash, paymentConfirmed: credit.status === "confirmed", billing: "credits" as const }
+              : { externalJobId: j.externalJobId, status: j.status, resultHash: j.resultHash, paymentConfirmed: !!j.paymentId && confirmed.has(j.paymentId) };
+          }),
           ...(conditionMet !== undefined ? { conditionMet } : {}),
-          deadline: r.expiresAt,
+          // monitor: its report window ends at the work deadline when there is one (not the vault expiry).
+          deadline: workEnd !== null ? Math.min(r.expiresAt, workEnd) : r.expiresAt,
           startedAt: r.startedAt,
           now: now(),
         });
         if (verdict.ok) {
           const res = { accepted: true };
           reviews.set(id, res);
-          bus.emit("handback_accepted", { goalId: r.goalId, sessionId: id, data: { summary: handback.summary, attempt: r.doneAttempts + 1 } });
-          await mgr.transition(id, "CLOSING", "handback accepted (definition of done met)");
+          bus.emit("handback_accepted", { goalId: r.goalId, sessionId: id, data: { summary: handback.summary, attempt: r.doneAttempts + 1, ...(timeBoxed ? { timeBoxed: true, partial: isTimeLimitPartial(handback) } : {}) } });
+          await mgr.transition(id, "CLOSING", timeBoxed ? "work deadline: handback accepted (definition of done met)" : "handback accepted (definition of done met)");
+          return res;
+        }
+        if (timeBoxed) {
+          // Out of work time: keep what it delivered, close now (no second attempt). Recorded as TIMEBOXED.
+          const res = { accepted: true, reason: `time-boxed partial: ${verdict.reason}` };
+          reviews.set(id, res);
+          closeStatusOverride.set(id, TIMEBOXED_CLOSE_STATUS);
+          bus.emit("handback_accepted", { goalId: r.goalId, sessionId: id, data: { summary: handback.summary, attempt: r.doneAttempts + 1, timeBoxed: true, partial: true, doneMet: false, reason: verdict.reason } });
+          await mgr.transition(id, "CLOSING", `work deadline reached: partial handback kept (${verdict.reason})`);
           return res;
         }
         const attempts = r.doneAttempts + 1;
@@ -1188,7 +1298,7 @@ export function createSessionManager(deps: SessionManagerDeps): RuntimeSessionMa
       });
     },
     tree(goalId) {
-      return buildTree(db, goalId, { myrPerTusd: config.myrPerTusd, now: now() });
+      return buildTree(db, goalId, { myrPerTusd: config.myrPerTusd, now: now(), workDeadlineMs: config.workDeadlineMs });
     },
     async reconcile() {
       await reconcileSessions({ db, bus, chain, silos, signer, sessions: mgr, config });
@@ -1242,7 +1352,7 @@ export function createSessionManager(deps: SessionManagerDeps): RuntimeSessionMa
           for (const dep of JSON.parse(q.contextFromJson) as string[]) {
             const d = getSessionDb(db, dep);
             const already = (JSON.parse(must(q.id).contextInJson) as ContextIn[]).some((c) => c.fromSessionId === dep);
-            if (d?.handbackJson && !already && (d.closeStatus === "COMPLETED" || d.status === "COMPLETING")) {
+            if (d?.handbackJson && !already && (d.closeStatus === "COMPLETED" || d.closeStatus === TIMEBOXED_CLOSE_STATUS || d.status === "COMPLETING")) {
               try {
                 await mgr.passHandback(dep, q.id, "captain");
               } catch (e) {
@@ -1276,6 +1386,55 @@ export function createSessionManager(deps: SessionManagerDeps): RuntimeSessionMa
     },
     transitionsOf(id) {
       return db.select().from(transitions).where(eq(transitions.sessionId, id)).orderBy(asc(transitions.id)).all();
+    },
+    workDeadlineOf(id) {
+      const r = getSessionDb(db, id);
+      return r ? workDeadlineOf(r, config) : null;
+    },
+    async timeBox(id, reason) {
+      // Same lock as the mandate controls: a vault rotation in flight (PAUSED) finishes before the session closes.
+      return lock(id, async () => {
+        const r = getSessionDb(db, id);
+        if (!r || !["RUNNING", "PAUSED", "QUARANTINED"].includes(r.status)) return false;
+        // What the session recorded: last progress, pages read (successful fetches), payments made, delivered jobs.
+        const evs = bus.since(0, { sessionId: id });
+        const sources = evs.filter((e) => e.type === "web_fetch" && !e.data.blocked && Number(e.data.status ?? 0) < 400 && typeof e.data.url === "string").map((e) => String(e.data.url));
+        const txHashes = db
+          .select()
+          .from(payments)
+          .where(and(eq(payments.sessionId, id), inArray(payments.status, ["submitted", "confirmed"])))
+          .all()
+          .flatMap((p) => (p.txHash ? [p.txHash] : []));
+        const job = db.select().from(agentJobs).where(and(eq(agentJobs.sessionId, id), eq(agentJobs.status, "completed"))).all().find((j) => j.externalJobId && j.resultHash);
+        let lastProgress: string | null = null;
+        try {
+          lastProgress = r.lastCheckpoint ? ((JSON.parse(r.lastCheckpoint) as { progress?: string }).progress ?? null) : null;
+        } catch {
+          lastProgress = null;
+        }
+        const h = partialHandbackFrom({
+          taskType: r.taskType,
+          lastProgress,
+          sources,
+          txHashes,
+          job: job ? { jobId: job.externalJobId!, resultHash: job.resultHash!, result: job.result ?? "" } : null,
+          workSeconds: Math.round(config.workDeadlineMs / 1000),
+        });
+        bus.emit("progress", { goalId: r.goalId, sessionId: id, data: { kind: "log", level: "warn", text: `work deadline: ${reason}; collecting a partial handback` } });
+        if (r.status !== "RUNNING") {
+          // PAUSED / QUARANTINED: no review loop; keep the partial as data and close (TIMEBOXED).
+          updateSessionDb(db, id, { handbackJson: toJson(h) }, now());
+          bus.emit("handback_submitted", { goalId: r.goalId, sessionId: id, data: { summary: h.summary, tainted: r.tainted, attempt: r.doneAttempts + 1, sources: h.sources.length, txHashes: h.txHashes?.length ?? 0, job: h.job ?? null, timeBoxed: true, by: "watchdog" } });
+          if (r.status === "PAUSED") await mgr.transition(id, "RUNNING", "work deadline reached");
+          closeStatusOverride.set(id, TIMEBOXED_CLOSE_STATUS);
+          if (getSessionDb(db, id)?.status === "RUNNING") await mgr.transition(id, "COMPLETING", "work deadline reached");
+          await mgr.transition(id, "CLOSING", `work deadline reached: ${reason}`);
+          return true;
+        }
+        await mgr.acceptSubmission(id, h);
+        await mgr.reviewHandback(id);
+        return true;
+      });
     },
     async shutdown() {
       stopped = true;

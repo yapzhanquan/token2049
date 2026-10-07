@@ -8,6 +8,7 @@ import { RAW_UTF8_SHA256 } from "./hash";
 import { JournalStore } from "./journal";
 import { acquireWorkerLock } from "./lock";
 import { disabledGate, MpsPaymentGate } from "./payment-gate";
+import { ProgressReporter, SseGoalEvents } from "./progress";
 import { blockfrostUtxos } from "./settlement";
 import { CliSokosumi, clip, coworkerCoreLoader, locateCli, nodeCliRunner } from "./sokosumi";
 import { TaskRunner } from "./task-runner";
@@ -27,6 +28,9 @@ async function main() {
   const engine = new HttpEngine(cfg.engineUrl, cfg.engineToken, fetch, 180_000);
   const gate = cfg.gate.enabled ? new MpsPaymentGate(cfg.gate) : disabledGate;
   const readiness = gate.readiness();
+  const engineUserId = engineUserResolver(engine, store, cfg.engineUserEmail);
+  // Live progress comments: engine goal events replayed over SSE from a per-Task cursor, ≥ 10 s apart, ≤ 15 per Task.
+  const progress = new ProgressReporter({ soko, events: new SseGoalEvents(cfg.engineUrl, cfg.engineToken), engine, engineUserId, save: (j) => store.save(j) });
   const runner = new TaskRunner({
     soko,
     engine,
@@ -35,7 +39,8 @@ async function main() {
     cfg: cfg.runner,
     hashRule: RAW_UTF8_SHA256,
     fetchUtxos: blockfrostUtxos(cfg.blockfrostProjectId),
-    engineUserId: engineUserResolver(engine, store, cfg.engineUserEmail),
+    engineUserId,
+    progress,
   });
   const worker = new Worker({ coworkerId: cfg.coworkerId, soko, runner });
   console.log(

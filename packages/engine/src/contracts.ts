@@ -18,6 +18,7 @@ import type {
   TaskType,
   TreeDTO,
   AgentCatalogEntry,
+  PlanRationale,
 } from "@bulkhead/shared";
 import type { DB } from "@bulkhead/db";
 import type { Chain } from "@bulkhead/chain";
@@ -81,6 +82,10 @@ export interface SessionManager {
   tree(goalId: string): TreeDTO;
   /** On boot: reconcile non-CLOSED sessions with DB + chain before resuming (spec §5.2). */
   reconcile(): Promise<void>;
+  /** Work deadline of a session (startedAt + WORK_DEADLINE_SECONDS); null before RUNNING / when disabled. */
+  workDeadlineOf?(sessionId: string): number | null;
+  /** Work deadline reached: collect a partial handback and close the session (the watchdog's action). */
+  timeBox?(sessionId: string, reason: string): Promise<boolean>;
 }
 
 // ─────────────── SiloRunner (child_process.fork per session; IPC only) ───────────────
@@ -120,12 +125,30 @@ export interface StartJobContext {
   /** The session's resolved allowlist; `also` = other plan ids that resolved to the same address. */
   allowedPayees?: { id: string; address: string; also?: string[] }[];
 }
+/** Off-chain billing of a hired job (Sokosumi credits): the runner records it instead of an on-chain payment. */
+export interface OffChainBilling {
+  kind: "credits";
+  credits: number;
+  maxCredits: number;
+  organizationSlug: string;
+  /** payments.payee for the record, e.g. "sokosumi-credits:<slug>" (never an address). */
+  payee: string;
+}
+export interface StartedJob {
+  jobId: string;
+  paymentAddress: string;
+  amountMicro: bigint;
+  reference: string;
+  /** Set → no Signer payment: credits were charged off-chain by the market (market-sokosumi.ts). */
+  billing?: OffChainBilling;
+}
 export interface AgentMarket {
   catalog(): Promise<AgentCatalogEntry[]>;
-  startJob(serviceId: string, input: string, ctx?: StartJobContext): Promise<{ jobId: string; paymentAddress: string; amountMicro: bigint; reference: string }>;
+  startJob(serviceId: string, input: string, ctx?: StartJobContext): Promise<StartedJob>;
   status(serviceId: string, jobId: string): Promise<{ status: string; result?: string; resultHash?: string }>;
-  /** Optional payee aliases (e.g. "masumi:purchasing-wallet") → an allowlist entry. */
-  resolvePayeeAlias?(alias: string): Promise<{ id: string; label: string; address: string } | null>;
+  /** Optional payee aliases (e.g. "masumi:purchasing-wallet", "sokosumi:<agent id>") → an allowlist entry.
+   * `ownerAddress` = the session owner's treasury (used by off-chain-billed markets that need a harmless address). */
+  resolvePayeeAlias?(alias: string, ctx?: { ownerAddress?: string }): Promise<{ id: string; label: string; address: string } | null>;
 }
 
 // ─────────────── LLM ───────────────
@@ -161,7 +184,7 @@ export interface Captain {
   /** user → captain (POST /captain/messages). Always actionable. */
   userMessage(userId: string, goalId: string | null, text: string): Promise<void>;
   /** plan_task as a direct API (POST /goals) — returns a validated plan + funding preview. */
-  plan(args: { userId: string; goal: string; budgetTUSD: string; deadline: string; rules: string }): Promise<{ goalId: string; plan: Plan; fundingPreview: { feeLovelace: string; totalTusd: string; totalLovelace: string } }>;
+  plan(args: { userId: string; goal: string; budgetTUSD: string; deadline: string; rules: string }): Promise<{ goalId: string; plan: Plan; fundingPreview: { feeLovelace: string; totalTusd: string; totalLovelace: string }; rationale?: PlanRationale }>;
   readonly tools: readonly CaptainTool[];
 }
 

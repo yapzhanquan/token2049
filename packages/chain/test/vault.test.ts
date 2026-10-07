@@ -292,6 +292,20 @@ describe("tx builders (Mesh, offline; scripts evaluated with OfflineEvaluatorSca
     await expect(buildVaultRevoke({ ...c, utxos: us, ownerAddress: PAYEE, metadata674: meta })).rejects.toThrow(/owner address/);
   });
 
+  it("Revoke 674 anchors the goal id + sha256(utf8(handback text)) (trust receipts); an absent goal_id is omitted", async () => {
+    const { createHash } = await import("node:crypto");
+    const handback = JSON.stringify({ result: "Bought ✓\nline 2", summary: "ok" });
+    const hb = createHash("sha256").update(handback, "utf8").digest("hex");
+    const goalId = "g_844d6715-6b57-481b-aec6-555fcb56cc37"; // 38 bytes ≤ the CIP-20 64-byte string limit
+    const meta = { session_id: "ses_de6206b2d6a04271", log_sha256: "ab".repeat(32), handback_sha256: hb, status: "COMPLETED", goal_id: goalId };
+    const r = await buildVaultRevoke({ ...common(), utxos: [vaultUtxo(v, 6n * ADA, 1_000_000n)], ownerAddress: OWNER, metadata674: meta, ttlSlot: TIP_SLOT + 900 });
+    expect(metadataOf(r.unsignedTx)["674"]).toEqual({ msg: ["Bulkhead session close (vault revoke)"], ...meta });
+    const { goal_id: _omit, ...noGoal } = meta;
+    const r2 = await buildVaultRevoke({ ...common(), utxos: [vaultUtxo(v, 6n * ADA, 1_000_000n)], ownerAddress: OWNER, metadata674: { ...noGoal, goal_id: undefined }, ttlSlot: TIP_SLOT + 900 });
+    expect(metadataOf(r2.unsignedTx)["674"]).toEqual({ msg: ["Bulkhead session close (vault revoke)"], ...noGoal });
+    await expect(buildVaultRevoke({ ...common(), utxos: [vaultUtxo(v, 6n * ADA, 0n)], ownerAddress: OWNER, metadata674: { ...meta, goal_id: "g".repeat(65) } })).rejects.toThrow(/goal_id exceeds 64 bytes/);
+  });
+
   it("Recover: invalidBefore strictly after expiry, no required signer, everything → owner", async () => {
     const c = common();
     const from = vaultRecoverFromSlot(EXPIRY);

@@ -120,6 +120,11 @@ function assertPreprodAddress(addr: string, what: string): void {
   if (!/^addr_test1[02-9ac-hj-np-z]+$/.test(addr)) throw new Error(`${what} must be a preprod (addr_test1…) address, got ${addr.slice(0, 20)}…`);
 }
 
+/** Drop undefined fields (optional CIP-20 keys such as goal_id). */
+function definedStrings(obj: Record<string, string | undefined>): Record<string, string> {
+  return Object.fromEntries(Object.entries(obj).filter((e): e is [string, string] => typeof e[1] === "string"));
+}
+
 function assertMeta64(obj: Record<string, string>): void {
   for (const [k, v] of Object.entries(obj))
     if (Buffer.byteLength(v, "utf8") > 64) throw new Error(`metadata field ${k} exceeds 64 bytes`);
@@ -428,10 +433,11 @@ export class MeshTxService implements TxService {
     sessionId: string;
     signer: "captain" | "owner";
     toAddress: string;
-    metadata674: { session_id: string; log_sha256: string; handback_sha256: string; status: string };
+    metadata674: { session_id: string; log_sha256: string; handback_sha256: string; status: string; goal_id?: string };
   }): Promise<TxResult> {
     assertPreprodAddress(args.toAddress, "sweep destination");
-    assertMeta64(args.metadata674);
+    const meta674 = definedStrings(args.metadata674);
+    assertMeta64(meta674);
     const info = await this.sessionInfo(args.sessionId);
     const keyId = args.signer === "captain" ? "captain" : `treasury:${info.userId}`;
     return this.queue.run(info.address, async (ctx) => {
@@ -441,7 +447,7 @@ export class MeshTxService implements TxService {
       if (args.signer === "owner" && tip.slot < info.expirySlot) throw new NotYetExpiredError(tip.slot, info.expirySlot);
       const b = await this.builder();
       for (const u of all) b.txIn(u.txHash, u.outputIndex, u.amount, u.address, 0).txInScript(info.scriptCbor);
-      b.metadataValue(674, { msg: ["Bulkhead session close"], ...args.metadata674 });
+      b.metadataValue(674, { msg: ["Bulkhead session close"], ...meta674 });
       if (args.signer === "owner") b.invalidBefore(info.expirySlot);
       const hex = await b
         .changeAddress(args.toAddress)

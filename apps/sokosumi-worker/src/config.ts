@@ -3,7 +3,11 @@ import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { tusdToMicro } from "@bulkhead/shared";
 import type { MpsGateConfig } from "./payment-gate";
+import type { PaymentTiming } from "./quote";
 import type { RunnerConfig } from "./task-runner";
+
+/** Pay-by floor: the escrow lock on preprod took ~9 min (VERIFIED), so the buyer gets at least 12. */
+export const MIN_PAY_BY_MS = 12 * 60_000;
 import { ENGINE_USER_EMAIL } from "./worker";
 
 export const PACKAGE_DIR = resolve(fileURLToPath(new URL("..", import.meta.url)));
@@ -47,6 +51,14 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): WorkerConfig {
   if (idx !== undefined && idx !== "" && !/^\d+$/.test(idx)) throw new Error("MASUMI_PAYMENT_SOURCE_INDEX must be a non-negative integer");
   const orgSlug = env.SOKOSUMI_ORGANIZATION_SLUG?.trim() || undefined;
   if (orgSlug && !/^[a-z0-9][a-z0-9-]{0,62}$/.test(orgSlug)) throw new Error("SOKOSUMI_ORGANIZATION_SLUG is not a valid Workspace slug");
+  // Escrow + crew timing. PAY_BY ≥ 12 min (the preprod escrow lock took ~9 min; lower values are raised); the crew
+  // works WORK_DEADLINE_SECONDS (60) once the escrow is locked; RESULT_MARGIN_MINUTES (3) closes the sessions and
+  // submits the result hash. MPS times are then set at the minimums MPS accepts (quote.ts mpsTimes).
+  const timing: PaymentTiming = {
+    payByMs: Math.max(MIN_PAY_BY_MS, num(env, "PAY_BY_MINUTES", 12, 1) * 60_000),
+    workMs: num(env, "WORK_DEADLINE_SECONDS", 60, 1) * 1000,
+    resultMarginMs: num(env, "RESULT_MARGIN_MINUTES", 3, 1) * 60_000,
+  };
   return {
     coworkerId,
     organizationId: env.SOKOSUMI_ORGANIZATION_ID?.trim() || undefined,
@@ -61,13 +73,16 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): WorkerConfig {
         feeMicro,
         maxQuoteMicro,
         defaultBudgetMicro: tusd(env, "DEFAULT_CREW_BUDGET_TUSDM", "2"),
-        defaultDeadlineMs: num(env, "DEFAULT_DEADLINE_MINUTES", 120, 1) * 60_000,
+        // 0 = the minimum the payment service accepts (see quote.ts minResultDeadline).
+        defaultDeadlineMs: num(env, "DEFAULT_DEADLINE_MINUTES", 0, 0) * 60_000,
         minDeadlineMs: num(env, "MIN_DEADLINE_MINUTES", 15, 1) * 60_000,
         maxDeadlineMs: num(env, "MAX_DEADLINE_HOURS", 168, 1) * 3_600_000,
+        timing,
       },
       goalRules: env.SOKOSUMI_GOAL_RULES || "Deliver a concise, sourced result. Spend only what the goal needs.",
-      payByMs: num(env, "PAY_BY_MINUTES", 5, 1) * 60_000,
-      resultMarginMs: num(env, "RESULT_MARGIN_MINUTES", 20, 1) * 60_000,
+      payByMs: timing.payByMs,
+      workMs: timing.workMs,
+      resultMarginMs: timing.resultMarginMs,
       askTimeoutMs: num(env, "DECISION_ASK_TIMEOUT_MINUTES", 10, 1) * 60_000,
       commentWindowMs: num(env, "COMMENT_WINDOW_HOURS", 72, 0) * 3_600_000,
     },

@@ -26,10 +26,10 @@ async function main() {
   const db = (await import("@bulkhead/db")).rawSqlite();
   const s = db
     .prepare(
-      "SELECT s.id, s.user_id, s.status, s.address, s.expiry_slot, s.wallet_mode, s.script_hash, s.log_sha256, s.handback_sha256, u.treasury_address FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.id = ?",
+      "SELECT s.id, s.goal_id, s.user_id, s.status, s.address, s.expiry_slot, s.wallet_mode, s.script_hash, s.log_sha256, s.handback_sha256, u.treasury_address FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.id = ?",
     )
     .get(sessionId) as
-    | { id: string; user_id: string; status: string; address: string | null; expiry_slot: number | null; wallet_mode: string | null; script_hash: string | null; log_sha256: string | null; handback_sha256: string | null; treasury_address: string }
+    | { id: string; goal_id: string; user_id: string; status: string; address: string | null; expiry_slot: number | null; wallet_mode: string | null; script_hash: string | null; log_sha256: string | null; handback_sha256: string | null; treasury_address: string }
     | undefined;
   if (!s) throw new Error(`Session ${sessionId} not found in ${process.env.DATABASE_PATH ?? "the default DB"}`);
   if (!s.address || s.expiry_slot == null) throw new Error(`Session ${sessionId} has no wallet yet (status ${s.status}) — nothing to recover`);
@@ -58,7 +58,7 @@ async function main() {
     logSha = createHash("sha256").update(JSON.stringify(rows)).digest("hex");
   }
   try {
-    const metadata674 = { session_id: s.id, log_sha256: logSha, handback_sha256: s.handback_sha256 ?? "none", status: "RECOVERED_BY_OWNER" };
+    const metadata674 = { session_id: s.id, log_sha256: logSha, handback_sha256: s.handback_sha256 ?? "none", status: "RECOVERED_BY_OWNER", goal_id: s.goal_id };
     let r;
     if (vault) {
       const recover = vaultRecoverOf(chain);

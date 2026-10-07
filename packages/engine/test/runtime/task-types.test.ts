@@ -95,7 +95,8 @@ describe("silo isolation", () => {
   }, 40_000);
 
   it("wall-clock deadline → EXPIRED → CLOSING → CLOSED", async () => {
-    h = await setup({ realSilos: true, supervisor: true, config: { heartbeatMs: 5_000 } });
+    // No work deadline here: the planned deadline IS the wallet expiry (legacy path; see work-deadline.test.ts).
+    h = await setup({ realSilos: true, supervisor: true, config: { heartbeatMs: 5_000, workDeadlineMs: 0 } });
     const goalId = h.newGoal();
     const [id] = await h.sessions.startPlan(goalId, { sessions: [spec({ goal: "hang #mock:hang", deadline: new Date(Date.now() + 2_500).toISOString() })] });
     await h.sessions.whenClosed(id!, 30_000);

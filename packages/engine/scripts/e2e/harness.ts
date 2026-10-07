@@ -60,6 +60,9 @@ export function runtimeOverrides(dry: boolean, marketUrl: string): Partial<Runti
     marketUrl,
     // The fixture page server and the market listen on 127.0.0.1 (egress normally blocks private IPs).
     allowPrivateHosts: ["127.0.0.1", "localhost"],
+    // This run verifies the on-chain windows themselves (planned expiry, owner Recover after expiry, restarts), so
+    // the crew is not time-boxed here unless E2E_WORK_DEADLINE_SECONDS asks for it (the app default is 60 s).
+    workDeadlineMs: Math.max(0, Number(process.env.E2E_WORK_DEADLINE_SECONDS ?? 0) || 0) * 1000,
   };
   if (!dry) return { ...base, jobPollMs: 5_000 };
   return {

@@ -241,6 +241,23 @@ export function eventToRow(e: BulkheadEvent, sess: Map<string, SessInfo>): (Acti
         collapseKey: d.topupId ? `top:${s(d.topupId)}` : undefined,
       });
     }
+    case "treasury_refill": {
+      // Treasury autopilot (treasury-autopilot.ts): funding account → delegated treasury, one tx with a CIP-20 memo.
+      const amounts = (d.amounts ?? {}) as Record<string, unknown>;
+      const to = (d.to ?? {}) as Record<string, unknown>;
+      const from = (d.from ?? {}) as Record<string, unknown>;
+      const lov = sOrNull(amounts.lovelace);
+      return r({
+        kind: "topup",
+        title: `Treasury autopilot: ${tusd(amounts.tusdMicro)}${lov && lov !== "0" ? ` + ${s(amounts.ada)} tADA` : ""} ${s(from.email) || "funding account"} → ${s(to.email) || "treasury"}${d.reason ? ` (${clip(s(d.reason), 60)})` : ""}${d.status === "submitted" ? " — submitted" : ""}`,
+        txHash: sOrNull(d.tx),
+        address: sOrNull(to.address),
+        amountMicro: sOrNull(amounts.tusdMicro),
+        direction: null,
+        status: d.status === "confirmed" ? "confirmed" : "pending",
+        collapseKey: d.tx ? `refill:${s(d.tx)}` : undefined,
+      });
+    }
     case "tool_denied":
       return r({ kind: "rejection", title: `${sessName}: tool ${s(d.tool)} denied${d.reason ? ` (${clip(s(d.reason), 80)})` : ""}`, status: "denied" });
     case "mandate_change_ignored":

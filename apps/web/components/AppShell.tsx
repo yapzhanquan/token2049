@@ -10,6 +10,12 @@ import { api, ConfigContext, LiveContext, useLive, useLiveStream, useResource, t
 import { UNFUNDED_GOAL_TEXT, describeEvent, isGoalUnfunded } from "@/lib/describe";
 import { dateTimeOf, myr, timeOf, TICKER } from "@/lib/money";
 import { WalletContext, type WalletState } from "@/lib/wallet-context";
+import { GoalEventsContext, useGoalEventStore } from "@/lib/goal-events";
+import { AhoyBanner } from "./Ahoy";
+import { BearingsPanel, useBearings } from "./Bearings";
+import { CaptainFeed } from "./CaptainFeed";
+import { CrewWatch } from "./CrewWatch";
+import { PlanRationale, rationaleOf, stepsFromTree } from "./PlanRationale";
 import { PlannedGoalBar } from "./PlannedGoalBar";
 import { ActivityLog } from "./ActivityLog";
 import { AgentMap } from "./AgentMap";
@@ -25,7 +31,11 @@ import { TopBar } from "./TopBar";
 import { TreeCanvas } from "./TreeCanvas";
 import { TreeList } from "./TreeList";
 
-type Tab = "tree" | "activity" | "spending" | "logbook" | "decisions";
+type Tab = "bridge" | "crew" | "tree" | "activity" | "spending" | "logbook" | "decisions";
+const TABS: Tab[] = ["bridge", "crew", "tree", "activity", "spending", "logbook", "decisions"];
+
+// Browser-only: the on-chain verifier loads Mesh, which must never enter the server bundle.
+const GoalTrustReceipts = dynamic(() => import("./TrustReceipt").then((m) => m.GoalTrustReceipts), { ssr: false });
 
 // Mesh (CIP-30) is several MB: load it only when the user opens "Connect wallet" or is self-custody.
 const WalletLayer = dynamic(() => import("./WalletConnect"), {
@@ -60,7 +70,7 @@ function Workspace({ user }: { user: { name: string | null; email: string } }) {
   const { data: me, reload: reloadMe } = useResource<MeDTO & { mode?: string }>("/me");
   const { data: goals } = useResource<GoalSummary[]>("/goals");
   const [goalId, setGoalId] = useState<string | null>(null);
-  const [tab, setTab] = useState<Tab>("tree");
+  const [tab, setTab] = useState<Tab>("bridge");
   const [selected, setSelected] = useState<string | null>(null);
   const [panel, setPanel] = useState<"auto" | "captain">("auto");
   const [modal, setModal] = useState<null | "agentMap" | "topup" | "composer">(null);
@@ -86,6 +96,10 @@ function Workspace({ user }: { user: { name: string | null; email: string } }) {
   const { data: tree } = useResource<TreeDTO>(goalId ? `/goals/${goalId}/tree` : null);
   const goal = goals?.find((g) => g.id === goalId) ?? null;
   const node: TreeNode | null = (selected && tree?.nodes.find((n) => n.id === selected)) || null;
+  const sessionIds = useMemo(() => (tree?.nodes ?? []).filter((n) => n.kind === "session").map((n) => n.id), [tree]);
+  const goalEvents = useGoalEventStore(goalId, sessionIds);
+  const letters = useMemo(() => new Map((tree?.nodes ?? []).filter((n) => n.letter).map((n) => [n.id, n.letter!])), [tree]);
+  const letterOf = useCallback((sid?: string) => (sid ? letters.get(sid) : undefined), [letters]);
 
   // Stripe return.
   useEffect(() => {
@@ -98,7 +112,8 @@ function Workspace({ user }: { user: { name: string | null; email: string } }) {
 
   const selectSession = useCallback(
     async (sessionId: string, gid?: string) => {
-      setTab("tree");
+      // Stay on the Bridge / Crew view (the session opens in the side panel); elsewhere jump to the tree.
+      setTab((t) => (t === "bridge" || t === "crew" ? t : "tree"));
       setPanel("auto");
       setSelected(sessionId);
       let g = gid;
@@ -129,7 +144,7 @@ function Workspace({ user }: { user: { name: string | null; email: string } }) {
     setModal(null);
     if (c.kind === "agent_job") {
       setGoalId(c.goalId);
-      setTab("tree");
+      setTab((t) => (t === "bridge" || t === "crew" ? t : "tree"));
       setPanel("auto");
       setSelected(c.id);
     } else void selectSession(c.id, c.goalId);
@@ -146,15 +161,27 @@ function Workspace({ user }: { user: { name: string | null; email: string } }) {
       <JobPanel node={node} rate={rate} onClose={() => setSelected(null)} onParent={(id) => setSelected(id)} onActivity={showActivity} />
     ) : isSessionNode && selected ? (
       <SessionPanel key={selected} sessionId={selected} me={me} onClose={() => setSelected(null)} onActivity={showActivity} />
+    ) : tab === "bridge" || tab === "crew" ? (
+      <div className="flex flex-col gap-3">
+        {goal && <GoalCard goal={goal} tree={tree} rate={rate} onActivity={showActivity} />}
+        {tree && tree.nodes.some((n) => n.kind === "session") && (
+          <div className="panel p-2">
+            <div className="section-title px-2 pt-1">Crew · click to open a session</div>
+            <TreeList tree={tree} selected={selected} onSelect={(id) => { setPanel("auto"); setSelected(id); }} />
+          </div>
+        )}
+      </div>
     ) : (
       <div className="flex flex-col gap-3">
         {goal && <GoalCard goal={goal} tree={tree} rate={rate} onActivity={showActivity} />}
         <CaptainPanel goalId={goalId} onSelectSession={(id) => void selectSession(id)} />
       </div>
     );
+  const bearings = useBearings(goal, tree, rate);
 
   return (
     <WalletContext.Provider value={wallet}>
+    <GoalEventsContext.Provider value={goalEvents}>
       <TopBar
         me={me}
         user={user}
@@ -206,9 +233,11 @@ function Workspace({ user }: { user: { name: string | null; email: string } }) {
           </div>
         )}
 
+        <AhoyBanner me={me} rate={rate} letterOf={letterOf} onSelectSession={(id) => void selectSession(id)} onActivity={showActivity} />
+
         {/* Goal bar + tabs */}
         <div className="flex flex-wrap items-center gap-2">
-          <select className="input" style={{ width: "auto", maxWidth: 420, fontWeight: 600 }} value={goalId ?? ""} onChange={(e) => { setGoalId(e.target.value); setSelected(null); }} aria-label="Goal">
+          <select className="input" style={{ width: "auto", maxWidth: "min(420px, 100%)", fontWeight: 600 }} value={goalId ?? ""} onChange={(e) => { setGoalId(e.target.value); setSelected(null); }} aria-label="Goal">
             {!goals?.length && <option value="">No goals yet</option>}
             {goals?.map((g) => (
               <option key={g.id} value={g.id}>
@@ -219,8 +248,8 @@ function Workspace({ user }: { user: { name: string | null; email: string } }) {
           <button type="button" className="btn btn-primary" onClick={() => setModal("composer")}>
             New goal
           </button>
-          <div className="seg ml-auto" role="tablist">
-            {(["tree", "activity", "spending", "logbook", "decisions"] as Tab[]).map((t) => (
+          <div className="seg ml-auto" role="tablist" style={{ flexWrap: "wrap", maxWidth: "100%" }}>
+            {TABS.map((t) => (
               <button key={t} type="button" role="tab" aria-pressed={tab === t} onClick={() => setTab(t)}>
                 {t[0]!.toUpperCase() + t.slice(1)}
                 {t === "decisions" && (me?.openDecisions ?? 0) > 0 && <span className="badge-count">{me!.openDecisions}</span>}
@@ -228,7 +257,7 @@ function Workspace({ user }: { user: { name: string | null; email: string } }) {
             ))}
           </div>
         </div>
-        {lastEvent && (
+        {lastEvent && tab !== "bridge" && (
           <div className="text-[12px] mid flex items-center gap-2 min-w-0" aria-live="polite">
             <LiveDot />
             <span className="mono muted">{timeOf(lastEvent.at)}</span>
@@ -239,9 +268,27 @@ function Workspace({ user }: { user: { name: string | null; email: string } }) {
         <div className="grid gap-3 items-start" style={{ gridTemplateColumns: "minmax(0, 1fr)" }}>
           <div className="grid gap-3 items-start lg:[grid-template-columns:minmax(0,1fr)_440px]">
             <section className="min-w-0 flex flex-col gap-3">
-              {tab === "tree" && goal && isGoalUnfunded(goal) && (
-                <PlannedGoalBar goal={goal} rate={rate} onStarted={() => { reloadMe(); bump(); }} />
+              {(tab === "tree" || tab === "bridge") && goal && isGoalUnfunded(goal) && (
+                <PlannedGoalBar goal={goal} rate={rate} tree={tree} onStarted={() => { reloadMe(); bump(); }} />
               )}
+              {tab === "bridge" && (
+                <>
+                  {goal && (
+                    <BearingsPanel goal={goal} bearings={bearings} rate={rate} onSelectSession={(id) => void selectSession(id)} onActivity={showActivity} onDecisions={() => setTab("decisions")} />
+                  )}
+                  {!goal && goals && goals.length === 0 && (
+                    <div className="panel p-6 flex flex-col items-start gap-3">
+                      <div className="font-semibold">No goals yet</div>
+                      <div className="mid">Top up your treasury, then give the captain a goal. It plans a crew of sessions that run in parallel, each with its own wallet and mandate, and reports back only what matters.</div>
+                      <button type="button" className="btn btn-primary" onClick={() => setModal("composer")}>
+                        New goal
+                      </button>
+                    </div>
+                  )}
+                  <CaptainFeed me={me} goalId={goalId} letterOf={letterOf} rate={rate} onSelectSession={(id) => void selectSession(id)} onActivity={showActivity} />
+                </>
+              )}
+              {tab === "crew" && <CrewWatch tree={tree} rate={rate} onSelectSession={(id) => void selectSession(id)} onActivity={showActivity} />}
               {tab === "tree" &&
                 (tree ? (
                   <>
@@ -285,11 +332,12 @@ function Workspace({ user }: { user: { name: string | null; email: string } }) {
             setModal(null);
             setGoalId(gid);
             setSelected(null);
-            setTab("tree");
+            setTab("bridge");
             bump();
           }}
         />
       )}
+    </GoalEventsContext.Provider>
     </WalletContext.Provider>
   );
 }
@@ -329,7 +377,16 @@ function GoalCard({ goal, tree, rate, onActivity }: { goal: GoalSummary; tree: T
           {sessions.length} · {count("running")} running · {count("awaiting") + count("quarantined")} need attention · {count("closed")} closed · {count("failed")} failed/killed
         </dd>
       </dl>
-      <div className="text-[12px] muted">Select a node in the tree to see its session.</div>
+      {tree && tree.nodes.some((n) => n.kind === "session") && (
+        <details className="text-[12.5px]">
+          <summary className="cursor-pointer mid">Why this plan</summary>
+          <div className="pt-2">
+            <PlanRationale rationale={rationaleOf(goal)} steps={stepsFromTree(tree)} rate={rate} compact />
+          </div>
+        </details>
+      )}
+      {tree && tree.nodes.some((n) => n.kind === "session") && <GoalTrustReceipts goalId={goal.id} />}
+      <div className="text-[12px] muted">Select a session to see its mandate, wallet and live work.</div>
     </div>
   );
 }

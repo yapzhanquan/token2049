@@ -368,3 +368,14 @@ Bulkhead's settlement asset is now configurable (`SETTLEMENT_ASSET` / `SETTLEMEN
 | Balances at 2026-10-07T03:59:42Z (Blockfrost `/addresses/{addr}`) | operator `addr_test1qp7fqfzm…xmwku6`: 442.181738 tADA, 999,866.712770 tUSD, **0 tUSDM** · Sokosumi coworker custodial treasury `addr_test1qrw53vhedg…s4zzkgp` (user `u_4ff72b9a…`): 24.239663 tADA, 10.478723 tUSD, **0 tUSDM** · self-custody wallet `addr_test1qpyurdf6…8hmyt5`: 854.600006 tADA, 41.914892 tUSD, **2,100 tUSDM** | VERIFIED |
 | tUSDM vault: apply + fund → Pay (UPLC) → Revoke, self-custody unsigned funding in tUSDM | offline only (`packages/chain/test/settlement.test.ts`, Mesh offline evaluator) | VERIFIED offline |
 | tUSDM funding + Pay + Revoke on preprod | **not run**: the custodial treasury holds 0 tUSDM | NOT RUN |
+
+## Sokosumi credits hire (2026-10-07, sokosumi-market agent): `hire_agent` with `MARKET=sokosumi` — details in `docs/e2e-sokosumi.md`
+
+**Off-chain:** Sokosumi credits are platform credits, not a Cardano asset. Nothing in this section is on-chain and no tx hash exists.
+
+| claim | evidence | label |
+|---|---|---|
+| Job `01a114e1-8fb6-760a-a9e6-e67b40278cd8` ("Expose: Advanced Web Research", 1 credit, maxCredits 2) was created in the TOKEN2049 Origins Hackathon org (`01a109d1-…87cd`, slug `token2049-origins-hackathon-2026-nws2r7`) | 201 response `organizationId` = the org id; request carried `X-Organization-Slug` | VERIFIED |
+| Hackathon org credits 58,700 → 58,699; personal 3,250 → 3,250; Bulkhead org 250 → 250 | org-scoped + personal-scope + other-org balance reads before/after creation | VERIFIED (org pool is shared, so Δ is attributed by timing only: INFERRED that the −1 is ours) |
+| Job result + sha256(raw UTF-8 result) | status **completed**, 6,348-char result, sha256 `d44732fbdb07a5143aa39503371d8bdf3789b64366598ec1a87db304252615c0` (read 2026-10-07 after the API key was replaced; credits are off-chain) | VERIFIED |
+| Engine path (credit payment row, `agent_job_paid` kind credits, DoD on jobId + resultHash, incidents, cap) | `packages/engine/test/market-sokosumi.test.ts` (10 tests, offline fake API) | VERIFIED offline |

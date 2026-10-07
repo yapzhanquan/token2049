@@ -35,6 +35,7 @@ export async function main(env: NodeJS.ProcessEnv = process.env) {
     captainInfo: engine.captainInfo,
     wakeStats: () => engine.wake.stats,
     autoFundUserEmails: engine.config.autoFundUserEmails,
+    workDeadlineSeconds: Math.round(engine.config.workDeadlineMs / 1000),
   });
   const server = serve({ fetch: app.fetch, port, hostname }, (info) => log(`listening on http://${hostname}:${info.port} (loopback only unless ENGINE_HOST says otherwise)`));
 

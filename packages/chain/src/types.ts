@@ -154,7 +154,7 @@ export interface TxService {
     sessionId: string;
     signer: "captain" | "owner";
     toAddress: string;
-    metadata674: { session_id: string; log_sha256: string; handback_sha256: string; status: string };
+    metadata674: { session_id: string; log_sha256: string; handback_sha256: string; status: string; goal_id?: string };
   }): Promise<TxResult>;
   /** Operator → user treasury (top-up). Mints tUSD if the operator lacks enough. */
   operatorSend(args: { toAddress: string; tusdMicro: bigint; lovelace: bigint; reference: string }): Promise<TxResult>;
@@ -182,7 +182,7 @@ export interface TxService {
   vaultRevoke?(args: {
     sessionId: string;
     toAddress: string;
-    metadata674: { session_id: string; log_sha256: string; handback_sha256: string; status: string };
+    metadata674: { session_id: string; log_sha256: string; handback_sha256: string; status: string; goal_id?: string };
   }): Promise<TxResult>;
   /** Recover redeemer (permissionless after expiry; signerKeyId only provides collateral). Before expiry → NotYetExpiredError. */
   vaultRecover?(args: { sessionId: string; signerKeyId?: string; metadata674?: Record<string, string> }): Promise<TxResult>;

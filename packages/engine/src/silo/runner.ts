@@ -27,7 +27,7 @@ import type { AgentMarket, EventBus, LLM, SiloRunner } from "../contracts";
 import type { RuntimeSigner } from "../signer";
 import type { RuntimeSessionManager } from "../sessions";
 import { toJson } from "../bus";
-import { getSessionDb, newId, sleep, updateSessionDb, type RuntimeConfig } from "../sessions-store";
+import { getSessionDb, newId, sleep, updateSessionDb, workDeadlineOf, type RuntimeConfig } from "../sessions-store";
 import { egressFetch, type LookupFn } from "./egress";
 
 export interface RuntimeSiloRunner extends SiloRunner {
@@ -97,7 +97,8 @@ export function createSiloRunner(deps: SiloRunnerDeps): RuntimeSiloRunner {
     const jobs = db.select().from(agentJobs).where(and(eq(agentJobs.sessionId, sessionId), eq(agentJobs.status, "completed"))).all();
     const last = getSessionDb(db, sessionId)?.lastCheckpoint;
     return {
-      payments: pays.map((p) => ({ payee: p.payee, amountTUSD: microToTusd(BigInt(p.amountMicro)), txHash: p.txHash! })),
+      // On-chain payments only (off-chain credit rows have no tx hash).
+      payments: pays.filter((p) => p.txHash).map((p) => ({ payee: p.payee, amountTUSD: microToTusd(BigInt(p.amountMicro)), txHash: p.txHash! })),
       jobs: jobs.map((j) => ({ serviceId: j.serviceId, jobId: j.externalJobId ?? "", result: j.result ?? "", resultHash: j.resultHash ?? "" })),
       ...(last ? { lastProgress: (JSON.parse(last) as { progress?: string }).progress } : {}),
     };
@@ -118,6 +119,8 @@ export function createSiloRunner(deps: SiloRunnerDeps): RuntimeSiloRunner {
       perPaymentMaxTUSD: microToTusd(BigInt(r.perPaymentMaxMicro)),
       allowedPayees: JSON.parse(r.allowedPayeesJson),
       deadline: r.expiresAt,
+      // The crew's working time (separate from the vault expiry): hand back before it, partial at it.
+      ...(workDeadlineOf(r, config) !== null ? { workDeadline: workDeadlineOf(r, config)!, workSeconds: Math.round(config.workDeadlineMs / 1000) } : {}),
       ...(r.watchJson ? { watch: JSON.parse(r.watchJson) } : {}),
     };
   }
@@ -203,16 +206,30 @@ export function createSiloRunner(deps: SiloRunnerDeps): RuntimeSiloRunner {
         const jobRowId = newId("job");
         const t = now();
         db.insert(agentJobs).values({ id: jobRowId, sessionId, serviceId, externalJobId: job.jobId, input, priceMicro: job.amountMicro.toString(), status: "started", createdAt: t, updatedAt: t }).run();
-        ev("agent_hired", sessionId, { jobRowId, jobId: job.jobId, serviceId, paymentAddress: job.paymentAddress, priceMicro: job.amountMicro.toString(), priceTUSD: microToTusd(job.amountMicro) });
+        const credits = job.billing?.kind === "credits" ? job.billing : null;
+        ev("agent_hired", sessionId, { jobRowId, jobId: job.jobId, serviceId, paymentAddress: job.paymentAddress, priceMicro: job.amountMicro.toString(), priceTUSD: microToTusd(job.amountMicro), ...(credits ? { billing: "credits", credits: credits.credits, maxCredits: credits.maxCredits, organizationSlug: credits.organizationSlug } : {}) });
         const setJob = (patch: Partial<typeof agentJobs.$inferSelect>) => db.update(agentJobs).set({ ...patch, updatedAt: now() }).where(eq(agentJobs.id, jobRowId)).run();
-        // The agent's payment goes through the Signer like any other payment (allowlist, max, budget, approval).
-        const d = await payAndWait(sessionId, { payee: job.paymentAddress, amountMicro: job.amountMicro, memo: `hire ${serviceId} ref:${job.reference}`, reference: job.reference });
-        if (d.kind !== "submitted") {
-          setJob({ status: "failed", paymentId: d.paymentId });
-          return { ok: false, error: d.kind === "rejected" ? `payment rejected (${d.reason}): ${d.detail}` : "payment not approved" };
+        let d: { paymentId: string; txHash: string | null };
+        if (credits) {
+          // Off-chain (Sokosumi credits, charged to the configured organization by the market): no Signer, no tx.
+          // Recorded as a confirmed payment row with txHash NULL and payee "sokosumi-credits:<slug>"; amountMicro is
+          // the tUSD-equivalent the market's mandate cap counts against the session budget.
+          const paymentId = newId("pay");
+          db.insert(payments)
+            .values({ id: paymentId, sessionId, payee: credits.payee, amountMicro: job.amountMicro.toString(), memo: clip(`credits:${credits.credits} (max ${credits.maxCredits}) sokosumi job ${job.jobId} org ${credits.organizationSlug} — off-chain`, 200), status: "confirmed", txHash: null, createdAt: now(), updatedAt: now() })
+            .run();
+          d = { paymentId, txHash: null };
+        } else {
+          // The agent's payment goes through the Signer like any other payment (allowlist, max, budget, approval).
+          const pd = await payAndWait(sessionId, { payee: job.paymentAddress, amountMicro: job.amountMicro, memo: `hire ${serviceId} ref:${job.reference}`, reference: job.reference });
+          if (pd.kind !== "submitted") {
+            setJob({ status: "failed", paymentId: pd.paymentId });
+            return { ok: false, error: pd.kind === "rejected" ? `payment rejected (${pd.reason}): ${pd.detail}` : "payment not approved" };
+          }
+          d = { paymentId: pd.paymentId, txHash: pd.txHash };
         }
         setJob({ status: "paid", paymentId: d.paymentId });
-        ev("agent_job_paid", sessionId, { jobRowId, jobId: job.jobId, serviceId, txHash: d.txHash, paymentId: d.paymentId });
+        ev("agent_job_paid", sessionId, { jobRowId, jobId: job.jobId, serviceId, txHash: d.txHash, paymentId: d.paymentId, ...(credits ? { kind: "credits", billing: "credits", offChain: true, credits: credits.credits, maxCredits: credits.maxCredits, organizationSlug: credits.organizationSlug, amountTUSDEquivalent: microToTusd(job.amountMicro) } : {}) });
         const until = Math.min(getSessionDb(db, sessionId)!.expiresAt, now() + config.jobTimeoutMs);
         while (now() < until) {
           const st = getSessionDb(db, sessionId)?.status;
@@ -222,7 +239,7 @@ export function createSiloRunner(deps: SiloRunnerDeps): RuntimeSiloRunner {
             if (r.status === "completed") {
               setJob({ status: "completed", result: clip(r.result ?? "", 8_000), resultHash: r.resultHash ?? null });
               ev("agent_job_result", sessionId, { jobRowId, jobId: job.jobId, serviceId, resultHash: r.resultHash ?? null, preview: clip(r.result ?? "", 200) });
-              return { ok: true, result: { jobId: job.jobId, result: r.result ?? "", resultHash: r.resultHash ?? "", txHash: d.txHash } };
+              return { ok: true, result: { jobId: job.jobId, result: r.result ?? "", resultHash: r.resultHash ?? "", txHash: d.txHash, ...(credits ? { billing: "credits", credits: credits.credits } : {}) } };
             }
             if (r.status === "failed") {
               setJob({ status: "failed" });
@@ -352,6 +369,7 @@ export function createSiloRunner(deps: SiloRunnerDeps): RuntimeSiloRunner {
         BULKHEAD_SILO: "1",
         SILO_SESSION_ID: sessionId,
         SILO_HEARTBEAT_MS: String(config.heartbeatMs),
+        SILO_WORK_WRAPUP_MS: String(config.workWrapUpMs),
         TMPDIR: tempDir,
         TEMP: tempDir,
         TMP: tempDir,

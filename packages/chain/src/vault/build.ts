@@ -84,8 +84,11 @@ export interface BuildVaultPayArgs extends VaultBuildCommon {
 export interface Metadata674 {
   session_id: string;
   log_sha256: string;
+  /** sha256 of the exact UTF-8 handback text (raw, no nonce) — anchors the session's result on-chain. */
   handback_sha256: string;
   status: string;
+  /** Goal the session belongs to (trust receipts: ties the close tx to the goal). */
+  goal_id?: string;
 }
 
 export interface BuildVaultRevokeArgs extends VaultBuildCommon {
@@ -314,9 +317,14 @@ export async function buildVaultPay(a: BuildVaultPayArgs): Promise<VaultTxResult
   });
 }
 
-function closeMeta(m: Record<string, string> | undefined, title: string): object {
-  for (const [k, val] of Object.entries(m ?? {})) if (Buffer.byteLength(val, "utf8") > 64) throw new Error(`metadata field ${k} exceeds 64 bytes`);
-  return { msg: [title], ...(m ?? {}) };
+function closeMeta(m: Record<string, string | undefined> | undefined, title: string): object {
+  const fields: Record<string, string> = {};
+  for (const [k, val] of Object.entries(m ?? {})) {
+    if (val === undefined) continue; // optional keys (goal_id) are simply omitted
+    if (Buffer.byteLength(val, "utf8") > 64) throw new Error(`metadata field ${k} exceeds 64 bytes`);
+    fields[k] = val;
+  }
+  return { msg: [title], ...fields };
 }
 
 /** Captain sweeps every given vault UTxO to the owner address (metadata 674 with the close hashes). */
@@ -329,7 +337,7 @@ export async function buildVaultRevoke(a: BuildVaultRevokeArgs): Promise<VaultTx
     remainder: { address: a.ownerAddress, inlineVoid: false },
     requiredSigners: [a.vault.params.captainKeyHash],
     invalidHereafter: a.ttlSlot,
-    metadata674: closeMeta(a.metadata674 as unknown as Record<string, string>, "Bulkhead session close (vault revoke)"),
+    metadata674: closeMeta(a.metadata674 as unknown as Record<string, string | undefined>, "Bulkhead session close (vault revoke)"),
   });
 }
 
@@ -345,7 +353,7 @@ export async function buildVaultRecover(a: BuildVaultRecoverArgs): Promise<Vault
     requiredSigners: [],
     invalidBefore: a.validFromSlot,
     invalidHereafter: a.ttlSlot,
-    metadata674: closeMeta(a.metadata674 as Record<string, string> | undefined, "Bulkhead session recover (vault, after expiry)"),
+    metadata674: closeMeta(a.metadata674 as Record<string, string | undefined> | undefined, "Bulkhead session recover (vault, after expiry)"),
   });
 }
 

@@ -3,6 +3,7 @@
 // MANDATE, WALLET, CONTEXT IN, controls, decisions, MESSAGE BOX, PEEK, LIVE ACTIVITY, mandate
 // controls, ON CLOSE.
 import { useEffect, useRef, useState } from "react";
+import dynamic from "next/dynamic";
 import { glyphFor, type Decision } from "@bulkhead/shared";
 import type { MeDTO, SessionDetailDTO } from "@bulkhead/shared";
 import { api, postSigned, useLive, useNow, useResource } from "@/lib/client";
@@ -13,6 +14,9 @@ import { IdChip, Reconnecting } from "./IdChip";
 import { AddrLink, TxLink } from "./Links";
 import { useWalletSigner, useWalletState } from "@/lib/wallet-context";
 import { answerDecision } from "@/lib/wallet-decisions";
+
+// Client-only: the verifier lazily loads Mesh (@meshsdk/core), which must never enter the server bundle.
+const TrustReceipt = dynamic(() => import("./TrustReceipt").then((m) => m.TrustReceipt), { ssr: false });
 
 const ENDED = ["CLOSED", "KILLED", "FAILED", "EXPIRED", "CLOSING"];
 
@@ -306,6 +310,8 @@ export function SessionPanel({ sessionId, me, onClose, onActivity }: { sessionId
               </dl>
             </div>
           )}
+          {/* Trust receipt: what the contract enforced + "Verify on-chain" (runs in the browser, components/TrustReceipt.tsx). */}
+          <TrustReceipt sessionId={s.id} />
           {s.handback && (
             <div className="mt-2 panel p-3 flex flex-col gap-2" style={{ boxShadow: "none" }}>
               <div className="text-[12px] label">Full handback (data)</div>

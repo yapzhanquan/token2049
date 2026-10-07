@@ -108,14 +108,15 @@ export const FAST: Partial<RuntimeConfig> = {
   allowPrivateHosts: [],
 };
 
-export async function setup(opts: { realSilos?: boolean; config?: Partial<RuntimeConfig>; supervisor?: boolean; dbPath?: string; chain?: FakeChain; keepDb?: boolean } = {}) {
+export async function setup(opts: { realSilos?: boolean; config?: Partial<RuntimeConfig>; supervisor?: boolean; dbPath?: string; chain?: FakeChain; keepDb?: boolean; market?: (db: DB, chain: FakeChain, bus: ReturnType<typeof createEventBus>) => AgentMarket } = {}) {
   if (!opts.keepDb) closeDb();
   const db: DB = openDb(opts.dbPath ?? ":memory:");
   const chain = opts.chain ?? createFakeChain({ autoConfirmMs: 15 });
   const config = runtimeConfig({ ...FAST, ...opts.config });
   const bus = createEventBus(db, { now: config.now });
   const decisions = createDecisionLedger(db, bus, { now: config.now });
-  const market = createFakeMarket(chain);
+  // A custom market (e.g. Sokosumi tests) is typed as the fake market for the existing callers; only it has `.jobs`.
+  const market = (opts.market ? opts.market(db, chain, bus) : createFakeMarket(chain)) as ReturnType<typeof createFakeMarket>;
   const signer = createSigner({ db, bus, chain, decisions, config });
   const stub = createStubSilos();
   const silos: RuntimeSiloRunner = opts.realSilos ? createSiloRunner({ db, bus, chain, signer, market, config, fetchImpl: fakeFetch, lookup: fakeLookup }) : stub;

@@ -10,6 +10,7 @@ import { WakeFilter } from "../../src/captain/wake";
 import { MockLLM } from "../../src/llm/mock";
 import { createPlanner } from "../../src/planner";
 import { autoFundGoal } from "../../src/goal-funding";
+import { OutcomeReporter } from "../../src/captain/reports";
 import { setup, waitFor } from "./helpers";
 
 let cleanup: (() => Promise<void>) | null = null;
@@ -28,7 +29,10 @@ describe("autonomous crew (no clicks after delegation)", () => {
     const captain = new CaptainAgent({ db: h.db, chain: h.chain, bus: h.bus, sessions: h.sessions, decisions: h.decisions, market: h.market, llm, planner, wrapHandback });
     const wake = new WakeFilter({ bus: h.bus, captain, db: h.db, sessions: h.sessions }, { debounceMs: 10, absorbFlushMs: 500, watchdog: { loopFailures: 4, stallMs: 60_000 } });
     wake.start({ replay: false });
+    const reporter = new OutcomeReporter({ db: h.db, bus: h.bus, decisions: h.decisions, llm, wording: "llm" });
+    reporter.start();
     cleanup = async () => {
+      await reporter.stop();
       await wake.stop();
       await h.cleanup();
     };
@@ -77,5 +81,19 @@ describe("autonomous crew (no clicks after delegation)", () => {
     for (const t of triggers) expect(["progress", "tainted", "web_fetch", "session_funded", "payment_submitted"]).not.toContain(t);
     expect(triggers).toContain("session_looping");
     expect(triggers).toContain("goal_completed");
+    // Trust surface: one structured outcome report per accepted handback + one goal result, each with risk + evidence;
+    // every captain action carries a `why`.
+    await reporter.idle();
+    const reports = h.bus.since(0, { goalId }).filter((e) => e.type === "captain_report" && typeof e.data.kind === "string").map((e) => e.data);
+    expect(reports.filter((r) => r.kind === "session_result").map((r) => r.sessionId).sort()).toEqual(rows.map((r) => r.id).sort());
+    expect(reports.filter((r) => r.kind === "goal_result")).toHaveLength(1);
+    for (const r of reports) {
+      expect(["low", "medium", "high"]).toContain(r.risk);
+      expect(String(r.headline).length).toBeLessThanOrEqual(120);
+      expect((r.evidence as { kind: string }[]).some((e) => e.kind === "dod")).toBe(true);
+    }
+    const paid = reports.find((r) => r.kind === "session_result" && (r.evidence as { kind: string }[]).some((e) => e.kind === "tx"));
+    expect(paid, "a paying session's report cites its payment tx").toBeTruthy();
+    expect(h.bus.since(0, { goalId }).filter((e) => e.type === "captain_action").every((e) => typeof e.data.why === "string" && String(e.data.why).length > 5)).toBe(true);
   }, 90_000);
 });

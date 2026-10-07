@@ -10,7 +10,10 @@ export interface DoneJob {
   externalJobId: string | null;
   status: string; // agent_jobs.status
   resultHash: string | null;
+  /** on-chain: the Signer payment is confirmed. credits: the off-chain credit charge is recorded (confirmed row). */
   paymentConfirmed: boolean;
+  /** "credits" = billed off-chain (Sokosumi org credits; evidence = jobId + resultHash, no tx). Default on-chain. */
+  billing?: "onchain" | "credits";
 }
 export interface DoneContext {
   taskType: TaskType;
@@ -58,7 +61,12 @@ export function checkDone(c: DoneContext): DoneResult {
       if (!h.result?.trim()) return { ok: false, reason: "result is empty" };
       const job = c.jobs.find((j) => j.externalJobId === h.job!.jobId);
       if (!job) return { ok: false, reason: `job ${h.job.jobId} was not hired by this session` };
-      if (!job.paymentConfirmed) return { ok: false, reason: "the job payment is not confirmed on-chain" };
+      if (job.billing === "credits") {
+        // Sokosumi: credits are charged off-chain to the configured organization; the evidence is the job id +
+        // sha256(raw result) recorded by the market, plus the confirmed credit row (no tx hash).
+        if (!job.paymentConfirmed) return { ok: false, reason: "the Sokosumi credit charge for this job is not recorded" };
+        if (!job.resultHash || !/^[0-9a-f]{64}$/.test(job.resultHash)) return { ok: false, reason: "the Sokosumi job has no result hash" };
+      } else if (!job.paymentConfirmed) return { ok: false, reason: "the job payment is not confirmed on-chain" };
       if (job.status !== "completed") return { ok: false, reason: `job is ${job.status}, not completed` };
       if (!job.resultHash || job.resultHash !== h.job.resultHash) return { ok: false, reason: "result_hash does not match the paid agent's response" };
       return { ok: true };

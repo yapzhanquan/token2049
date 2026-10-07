@@ -9,14 +9,17 @@ import { api, ApiError, postSigned, useConfig, useResource } from "@/lib/client"
 import { ada, myr, tusd, TICKER } from "@/lib/money";
 import { planToTree } from "@/lib/tree-layout";
 import { Modal } from "./Modal";
+import { PlanRationale, rationaleOf, stepsFromPlan } from "./PlanRationale";
 import { TopUpDialog } from "./TopUpDialog";
 import { TreeCanvas } from "./TreeCanvas";
 import { TreeList } from "./TreeList";
 import { useWalletSigner } from "@/lib/wallet-context";
 
+/** Default OUTER deadline (advanced field): 30 minutes from now (rounded up to 5 min). The crew itself is
+ * time-boxed by the engine's work time (WORK_DEADLINE_SECONDS, shown as "Work time"). */
 function defaultDeadline(): string {
-  const d = new Date(Date.now() + 24 * 3600_000);
-  d.setMinutes(0, 0, 0);
+  const d = new Date(Date.now() + 30 * 60_000);
+  d.setMinutes(Math.ceil(d.getMinutes() / 5) * 5, 0, 0);
   const pad = (n: number) => String(n).padStart(2, "0");
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
@@ -27,6 +30,8 @@ export function GoalComposer({ me: meProp, onClose, onStarted }: { me: MeDTO | n
   const { data: meLive, reload: reloadMe } = useResource<MeDTO>("/me");
   const me = meLive ?? meProp;
   const rate = me?.myrPerTusd ?? "4.70";
+  /** WORK_DEADLINE_SECONDS from the engine (/me); 60 s when the engine does not say. */
+  const workSecs = me?.workDeadlineSeconds ?? 60;
   const signer = useWalletSigner();
   const [goal, setGoal] = useState("");
   const [unit, setUnit] = useState<"MYR" | "tUSD">("MYR");
@@ -136,11 +141,22 @@ export function GoalComposer({ me: meProp, onClose, onStarted }: { me: MeDTO | n
               </div>
               <span className="text-[11.5px] muted">{budgetTUSD ? `= ${budgetTUSD} ${TICKER} ≈ ${myr(tusdToMicro(budgetTUSD), rate)}` : ""}</span>
             </label>
-            <label className="flex flex-col gap-1">
-              <span className="label">Deadline</span>
-              <input className="input" type="datetime-local" value={deadline} onChange={(e) => setDeadline(e.target.value)} required />
-            </label>
+            <div className="flex flex-col gap-1">
+              <span className="label">Work time</span>
+              <div className="input flex items-center" style={{ width: 150 }} aria-readonly="true" title="Each session works this long after its wallet is funded, then hands back what it has.">
+                <b className="tabular-nums">{workSecs > 0 ? `${workSecs} s` : "no limit"}</b>
+              </div>
+              <span className="text-[11.5px] muted">per session, from funding · partial results at the limit</span>
+            </div>
           </div>
+          <details className="text-[12.5px]">
+            <summary className="cursor-pointer mid">Advanced: outer deadline</summary>
+            <label className="flex flex-col gap-1 mt-2">
+              <span className="label">Deadline (outer bound)</span>
+              <input className="input" style={{ maxWidth: 260 }} type="datetime-local" value={deadline} onChange={(e) => setDeadline(e.target.value)} required />
+              <span className="text-[11.5px] muted">The crew is time-boxed by the work time; wallet expiry is set by the engine (work + funding / close confirmation windows).</span>
+            </label>
+          </details>
           <label className="flex flex-col gap-1">
             <span className="label">Rules</span>
             <textarea className="input" rows={2} value={rules} onChange={(e) => setRules(e.target.value)} maxLength={1000} />
@@ -212,6 +228,9 @@ export function GoalComposer({ me: meProp, onClose, onStarted }: { me: MeDTO | n
               ))}
             </tbody>
           </table>
+          <div className="panel p-3" style={{ boxShadow: "none", borderColor: "color-mix(in srgb, var(--good) 30%, var(--rule))" }}>
+            <PlanRationale rationale={rationaleOf(plan, plan.plan)} steps={stepsFromPlan(plan.plan)} rate={rate} />
+          </div>
           <div className="panel p-3 flex flex-col gap-1" style={{ boxShadow: "none" }}>
             <div className="section-title">Funding transaction preview</div>
             <dl className="kv">

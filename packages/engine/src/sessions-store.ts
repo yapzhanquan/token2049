@@ -55,9 +55,51 @@ export interface RuntimeConfig {
   /** AUTO_FUND_USER_EMAILS (comma list): custodial API users whose new goals are funded at creation (delegated,
    * mandate-bounded; no UI click). Default: the Sokosumi worker + Masumi Standard API users. "none" = nobody. */
   autoFundUserEmails?: string[];
+  /** WORK_DEADLINE_SECONDS (default 60): the crew's WORKING time per session, counted from RUNNING (vault funded).
+   * The silo hands back before it (partial at the deadline); the captain's watchdog collects + closes. 0 = no limit
+   * (legacy: the vault expiry is the only deadline). Separate from the on-chain safety windows below. */
+  workDeadlineMs: number;
+  /** WORK_WRAPUP_SECONDS (default 15): the silo is told "wrap up now" this long before the work deadline. */
+  workWrapUpMs: number;
+  /** VAULT_EXPIRY_BUFFER_SECONDS (default 300): vault expiry headroom AFTER the work deadline (Pay + close confirmation). */
+  vaultExpiryBufferMs: number;
+  /** VAULT_FUNDING_ALLOWANCE_SECONDS (default 300): time for the funding tx (incl. a wallet signature) to confirm
+   * before the work starts; part of the minimal vault expiry. */
+  vaultFundingAllowanceMs: number;
 }
 
 export const DEFAULT_AUTO_FUND_USER_EMAILS = ["sokosumi-coworker@bulkhead.local", "masumi-standard@bulkhead.local"];
+
+const envSeconds = (raw: string | undefined, dflt: number): number => {
+  if (raw === undefined || raw.trim() === "") return dflt;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? n : dflt;
+};
+
+/** WORK_DEADLINE_SECONDS (default 60; 0 = no work limit). */
+export function workDeadlineSecondsFromEnv(env: NodeJS.ProcessEnv = process.env): number {
+  return envSeconds(env.WORK_DEADLINE_SECONDS, 60);
+}
+
+/** WORK_GRACE_SECONDS (default 5) in ms: the watchdog waits this long past a work deadline for the silo's own handback. */
+export function workGraceMsFromEnv(env: NodeJS.ProcessEnv = process.env): number {
+  return Math.round(envSeconds(env.WORK_GRACE_SECONDS, 5) * 1000);
+}
+
+/** A session's work deadline (POSIX ms): startedAt + WORK_DEADLINE_SECONDS; null before RUNNING or when disabled. */
+export function workDeadlineOf(row: { startedAt: number | null }, config: Pick<RuntimeConfig, "workDeadlineMs">): number | null {
+  return config.workDeadlineMs > 0 && row.startedAt ? row.startedAt + config.workDeadlineMs : null;
+}
+
+/**
+ * Minimal-but-valid vault expiry for a session created now that starts in `wave` (0 = right after funding; a
+ * dependent / queued session waits for earlier waves): funding allowance + the work of every wave up to its own +
+ * the Pay/close buffer. The captain Revokes at close (any time, session_vault.ak `Revoke`), so the expiry only
+ * bounds the session key's Pay window and the owner's Recover fallback.
+ */
+export function minVaultExpiry(now: number, config: Pick<RuntimeConfig, "workDeadlineMs" | "vaultExpiryBufferMs" | "vaultFundingAllowanceMs">, wave = 0): number {
+  return now + config.vaultFundingAllowanceMs + (Math.max(0, wave) + 1) * config.workDeadlineMs + config.vaultExpiryBufferMs;
+}
 
 export function runtimeConfig(overrides: Partial<RuntimeConfig> = {}): RuntimeConfig {
   const env = process.env;
@@ -99,6 +141,10 @@ export function runtimeConfig(overrides: Partial<RuntimeConfig> = {}): RuntimeCo
     walletMode: env.WALLET_MODE?.trim().toLowerCase() === "native" ? "native" : "vault",
     spawnBatchMs: Math.max(0, Number(env.SPAWN_BATCH_MS ?? 300) || 0),
     goalReconcileMs: Math.max(0, Number(env.GOAL_RECONCILE_MS ?? 60_000) || 0),
+    workDeadlineMs: Math.round(workDeadlineSecondsFromEnv(env) * 1000),
+    workWrapUpMs: Math.round(envSeconds(env.WORK_WRAPUP_SECONDS, 15) * 1000),
+    vaultExpiryBufferMs: Math.round(envSeconds(env.VAULT_EXPIRY_BUFFER_SECONDS, 300) * 1000),
+    vaultFundingAllowanceMs: Math.round(envSeconds(env.VAULT_FUNDING_ALLOWANCE_SECONDS, 300) * 1000),
     autoFundUserEmails: (() => {
       const raw = env.AUTO_FUND_USER_EMAILS?.trim();
       if (raw === undefined || raw === "") {

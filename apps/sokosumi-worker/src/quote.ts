@@ -7,9 +7,52 @@ export interface QuoteConfig {
   feeMicro: bigint; // BULKHEAD_FEE_TUSDM (default 0.5)
   maxQuoteMicro: bigint; // MAX_QUOTE_TUSDM (default 20)
   defaultBudgetMicro: bigint; // DEFAULT_CREW_BUDGET_TUSDM (default 2)
-  defaultDeadlineMs: number; // DEFAULT_DEADLINE_MINUTES (default 120)
+  /** DEFAULT_DEADLINE_MINUTES (default 0 = the minimum the payment service accepts, see minResultDeadline). */
+  defaultDeadlineMs: number;
   minDeadlineMs: number; // MIN_DEADLINE_MINUTES (default 15)
   maxDeadlineMs: number; // MAX_DEADLINE_HOURS (default 168)
+  /** Escrow + crew timing; when set, the Task deadline (= MPS submitResultTime) is never below minResultDeadline. */
+  timing?: PaymentTiming;
+}
+
+// ─────────────── MPS time windows ───────────────
+// masumi-payment-service src/routes/api/payments/index.ts (POST /payment) refuses a request unless:
+//   payByTime ≤ submitResultTime − 5 min · payByTime ≥ now − 5 min · submitResultTime ≥ now + 15 min
+//   unlockTime ≥ submitResultTime + 15 min · externalDisputeUnlockTime ≥ unlockTime + 15 min
+const MIN = 60_000;
+export const MPS_MIN_SUBMIT_AHEAD_MS = 15 * MIN;
+export const MPS_MIN_PAYBY_TO_SUBMIT_MS = 5 * MIN;
+export const MPS_MIN_UNLOCK_GAP_MS = 15 * MIN;
+/** Clock skew / request latency headroom added to every MPS minimum (MPS checks against its own Date.now()). */
+export const MPS_SKEW_MS = 1 * MIN;
+
+export interface PaymentTiming {
+  /** PAY_BY_MINUTES (≥ 12: the preprod escrow lock took ~9 min). */
+  payByMs: number;
+  /** WORK_DEADLINE_SECONDS: the crew works this long once the escrow is locked. */
+  workMs: number;
+  /** RESULT_MARGIN_MINUTES: closing the sessions + submitting the result hash after the work. */
+  resultMarginMs: number;
+}
+
+/**
+ * The earliest result deadline (submitResultTime) that is valid for MPS AND leaves the crew its work time + the
+ * close/result margin even when the escrow locks at the very last pay-by moment.
+ */
+export function minResultDeadline(now: number, t: PaymentTiming): number {
+  return now + Math.max(MPS_MIN_SUBMIT_AHEAD_MS, t.payByMs + MPS_MIN_PAYBY_TO_SUBMIT_MS, t.payByMs + t.workMs + t.resultMarginMs) + MPS_SKEW_MS;
+}
+
+/** MPS payment-request times at the minimums MPS accepts; the Task deadline only ever raises submitResultTime. */
+export function mpsTimes(now: number, taskDeadlineMs: number, t: PaymentTiming): { payByTime: Date; submitResultTime: Date; unlockTime: Date; externalDisputeUnlockTime: Date } {
+  const submit = Math.max(taskDeadlineMs, minResultDeadline(now, t));
+  const unlock = submit + MPS_MIN_UNLOCK_GAP_MS + MPS_SKEW_MS;
+  return {
+    payByTime: new Date(now + t.payByMs),
+    submitResultTime: new Date(submit),
+    unlockTime: new Date(unlock),
+    externalDisputeUnlockTime: new Date(unlock + MPS_MIN_UNLOCK_GAP_MS + MPS_SKEW_MS),
+  };
 }
 
 export const MAX_GOAL_CHARS = 4000;
@@ -69,11 +112,20 @@ export function parseOrder(input: string, cfg: QuoteConfig, now: number, taskNam
     deadlineMs = parseDeadline(d[1], now);
     if (deadlineMs === null) notes.push(`Deadline "${d[1].slice(0, 60)}" not understood; default used.`);
   }
-  if (deadlineMs === null) deadlineMs = now + cfg.defaultDeadlineMs;
-  if (deadlineMs < now + cfg.minDeadlineMs) {
-    notes.push(`Deadline raised to the minimum of ${Math.round(cfg.minDeadlineMs / 60_000)} minutes.`);
-    deadlineMs = now + cfg.minDeadlineMs;
+  // The minimum: MIN_DEADLINE_MINUTES, and (paid Tasks) what MPS accepts for the result deadline given the pay-by
+  // window, the crew's work time and the close/result margin (minResultDeadline).
+  const mpsMin = cfg.timing ? minResultDeadline(now, cfg.timing) - now : 0;
+  const minMs = Math.max(cfg.minDeadlineMs, mpsMin);
+  if (deadlineMs === null) deadlineMs = now + Math.max(cfg.defaultDeadlineMs, minMs);
+  if (deadlineMs < now + minMs) {
+    notes.push(
+      mpsMin >= cfg.minDeadlineMs && cfg.timing
+        ? `Deadline raised to the minimum of ${Math.ceil(minMs / 60_000)} minutes (the payment service needs the result ≥ 15 min ahead and ≥ 5 min after the ${Math.round(cfg.timing.payByMs / 60_000)}-min pay-by window).`
+        : `Deadline raised to the minimum of ${Math.round(minMs / 60_000)} minutes.`,
+    );
+    deadlineMs = now + minMs;
   }
+  if (cfg.timing) notes.push(`Crew works for ${Math.round(cfg.timing.workMs / 1000)} s after escrow locks (time-boxed), then closes its wallets and reports.`);
   if (deadlineMs > now + cfg.maxDeadlineMs) {
     notes.push(`Deadline lowered to the maximum of ${Math.round(cfg.maxDeadlineMs / 3_600_000)} hours.`);
     deadlineMs = now + cfg.maxDeadlineMs;

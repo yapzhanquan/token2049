@@ -2,12 +2,13 @@
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { ApproveResponse, CaptainMessageBody, ControlAction, DecisionDTO, GoalSummary, PlanBody, PlanResponse, SessionDetailDTO, TreeDTO, TreeNode } from "@bulkhead/shared";
+import type { ApproveResponse, BulkheadEvent, CaptainMessageBody, ControlAction, DecisionDTO, GoalSummary, PlanBody, PlanResponse, SessionDetailDTO, TreeDTO, TreeNode } from "@bulkhead/shared";
 import type { EnginePort } from "../src/engine";
 import { EngineHttpError } from "../src/engine";
 import { RAW_UTF8_SHA256 } from "../src/hash";
 import { JournalStore } from "../src/journal";
 import { TUSDM_UNIT, type PaymentGate, type SellerIdentity, type TermsRequest } from "../src/payment-gate";
+import { ProgressReporter, type GoalEventSource, type ProgressOptions } from "../src/progress";
 import type { QuoteConfig } from "../src/quote";
 import type { SokosumiPort } from "../src/sokosumi";
 import { TaskRunner, type RunnerConfig } from "../src/task-runner";
@@ -108,7 +109,7 @@ export class FakeEngine implements EnginePort {
   calls: { op: string; arg?: unknown }[] = [];
   fail: Partial<Record<string, Error>> = {};
   /** Session plan per goal: roles and budgets (micro). */
-  plan: { role: string; budgetMicro: bigint }[] = [{ role: "researcher", budgetMicro: 1_000_000n }, { role: "writer", budgetMicro: 1_000_000n }];
+  plan: { role: string; budgetMicro: bigint; name?: string; contextFrom?: number[] }[] = [{ role: "researcher", budgetMicro: 1_000_000n }, { role: "writer", budgetMicro: 1_000_000n }];
   private n = 0;
   private check(op: string) {
     const e = this.fail[op];
@@ -127,7 +128,8 @@ export class FakeEngine implements EnginePort {
     this.check("createGoal");
     const id = `g_${++this.n}`;
     this.goals.push({ id, userId, goal: body.goal, budgetMicro: String(Math.round(Number(body.budgetTUSD) * 1e6)), deadline: Date.parse(body.deadline), rules: body.rules, status: "planned", fundingTx: null, createdAt: Date.now() });
-    return { goalId: id, plan: { sessions: [] } as never, fundingPreview: { feeLovelace: "0", totalTusd: body.budgetTUSD, totalLovelace: "0" } };
+    const sessions = this.plan.map((p) => ({ name: p.name ?? p.role, role: p.role, budgetTUSD: (Number(p.budgetMicro) / 1e6).toString(), contextFrom: p.contextFrom ?? [] }));
+    return { goalId: id, plan: { sessions } as never, fundingPreview: { feeLovelace: "0", totalTusd: body.budgetTUSD, totalLovelace: "0" } };
   }
   async listGoals(userId: string) {
     return this.goals.filter((g) => g.userId === userId).map(({ userId: _u, ...g }) => g);
@@ -317,6 +319,24 @@ export const QUOTE_CFG: QuoteConfig = {
 };
 export const RUNNER_CFG: RunnerConfig = { quote: QUOTE_CFG, goalRules: "test rules", payByMs: 5 * 60_000, resultMarginMs: 20 * 60_000, askTimeoutMs: 10 * 60_000, commentWindowMs: 72 * 3_600_000 };
 
+/** Engine goal events (what GET /events/stream replays), in id order. */
+export class FakeGoalEvents implements GoalEventSource {
+  list: BulkheadEvent[] = [];
+  fail?: Error;
+  reads = 0;
+  private n = 0;
+  push(goalId: string, type: BulkheadEvent["type"], data: Record<string, unknown> = {}, sessionId?: string) {
+    const e: BulkheadEvent = { id: ++this.n, at: Date.now(), type, goalId, ...(sessionId ? { sessionId } : {}), data };
+    this.list.push(e);
+    return e;
+  }
+  async since(_u: string, goalId: string, after: number) {
+    this.reads++;
+    if (this.fail) throw this.fail;
+    return this.list.filter((e) => e.goalId === goalId && e.id > after).map((e) => structuredClone(e));
+  }
+}
+
 export interface Rig {
   dir: string;
   soko: FakeSoko;
@@ -328,10 +348,11 @@ export interface Rig {
   logs: string[];
   /** What the Blockfrost fetcher returns (null = not determinable). */
   utxos: import("../src/settlement").TxUtxos | null;
+  events: FakeGoalEvents;
 }
 
 /** A fresh runner over shared state; call `rig.runner()` again to simulate a process restart. */
-export function makeRig(opts: { paid?: boolean; dir?: string } = {}): Rig {
+export function makeRig(opts: { paid?: boolean; dir?: string; progress?: boolean | ProgressOptions; cfg?: Partial<RunnerConfig> } = {}): Rig {
   const dir = opts.dir ?? tmpDir();
   const soko = new FakeSoko();
   const engine = new FakeEngine();
@@ -339,7 +360,14 @@ export function makeRig(opts: { paid?: boolean; dir?: string } = {}): Rig {
   gate.ready = !!opts.paid;
   const clock = { t: Date.parse("2026-10-07T10:00:00Z") };
   const logs: string[] = [];
+  const events = new FakeGoalEvents();
+  const engineUserId = async () => engine.ensureUser("sokosumi-coworker@bulkhead.local");
+  const progress = () =>
+    opts.progress
+      ? new ProgressReporter({ soko, events, engine, engineUserId, save: (j) => new JournalStore(dir).save(j), now: () => clock.t, log: (m) => logs.push(m), ...(typeof opts.progress === "object" ? opts.progress : {}) })
+      : undefined;
   const rig: Rig = {
+    events,
     dir,
     soko,
     engine,
@@ -354,12 +382,13 @@ export function makeRig(opts: { paid?: boolean; dir?: string } = {}): Rig {
         engine,
         gate,
         store: new JournalStore(dir),
-        cfg: RUNNER_CFG,
+        cfg: { ...RUNNER_CFG, ...opts.cfg },
         hashRule: RAW_UTF8_SHA256,
         fetchUtxos: async () => rig.utxos,
-        engineUserId: async () => engine.ensureUser("sokosumi-coworker@bulkhead.local"),
+        engineUserId,
         now: () => clock.t,
         log: (m) => logs.push(m),
+        progress: progress(),
       }),
   };
   return rig;

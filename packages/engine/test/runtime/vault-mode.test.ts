@@ -105,7 +105,7 @@ describe("walletMode vault — lifecycle on the FakeChain", () => {
     expect(revoke.outputs).toEqual([{ address: h.treasury, tusdMicro: 8_000_000n, lovelace: inVault.lovelace - FAKE_FEE_LOVELACE }]);
     const m = revoke.metadata!["674"] as Record<string, unknown>;
     const closed = dbRow(h, id);
-    expect(m).toEqual({ session_id: id, log_sha256: closed.logSha256, handback_sha256: closed.handbackSha256, status: "KILLED" });
+    expect(m).toEqual({ session_id: id, log_sha256: closed.logSha256, handback_sha256: closed.handbackSha256, status: "KILLED", goal_id: closed.goalId });
     expect(closed.closeTx).toBe(revoke.txHash);
     expect(closed.refundMicro).toBe("8000000");
     expect(h.chain.balance(r.address!)).toEqual({ tusdMicro: 0n, lovelace: 0n });

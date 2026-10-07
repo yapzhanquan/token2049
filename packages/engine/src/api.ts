@@ -60,6 +60,9 @@ import { toJsonSafe } from "./captain/tools";
 import { createStakingRoutes } from "./api-staking";
 import { createWalletRoutes } from "./api-wallet";
 import { createActivityRoutes } from "./api-activity";
+import { createBridgeRoutes } from "./api-bridge";
+import { rationaleFromPlanJson, walletModeFromEnv } from "./captain/rationale";
+import { createProofRoutes } from "./api-proof";
 import { autoFundGoal, isDelegatedUser, startGoal } from "./goal-funding";
 
 /** The parts of the runtime OnRamp the API uses. */
@@ -82,6 +85,10 @@ export interface ApiDeps {
   wakeStats?: () => { woken: number; absorbed: number };
   /** AUTO_FUND_USER_EMAILS: custodial users whose POST /goals are funded at creation (delegated, mandate-bounded). */
   autoFundUserEmails?: string[];
+  /** Where POST /bearings/file writes its dated markdown reports (default data/reports next to the database). */
+  reportsDir?: string;
+  /** WORK_DEADLINE_SECONDS (engine.config.workDeadlineMs / 1000): shown by /me + /health (GoalComposer "Work time"). */
+  workDeadlineSeconds?: number;
 }
 
 type Vars = { Variables: { userId: string } };
@@ -108,7 +115,7 @@ export function createApi(deps: ApiDeps) {
   });
 
   app.get("/health", (c) => {
-    const h: HealthDTO = { ok: true, network: NETWORK, llm: engine.llm.name, chain: deps.chainLabel ?? chain.provider.name, simulatedChain: deps.chainLabel === "fake", at: Date.now() };
+    const h: HealthDTO = { ok: true, network: NETWORK, llm: engine.llm.name, chain: deps.chainLabel ?? chain.provider.name, simulatedChain: deps.chainLabel === "fake", at: Date.now(), ...(deps.workDeadlineSeconds !== undefined ? { workDeadlineSeconds: deps.workDeadlineSeconds } : {}) };
     return c.json(h);
   });
 
@@ -235,6 +242,12 @@ export function createApi(deps: ApiDeps) {
   // ── staking + vote delegation (api-staking.ts) ──
   app.route("/", createStakingRoutes({ db, chain, signing }));
   app.route("/", createActivityRoutes({ db, chain, simulated: deps.chainLabel === "fake" })); // activity feed (api-activity.ts)
+  // Bearings + ahoy (api-bridge.ts): deterministic digests from DB + chain, open decisions ranked by impact.
+  app.route(
+    "/",
+    createBridgeRoutes({ db, bus, chain, decisions, llm: engine.llm, reportsDir: deps.reportsDir, ...(signing ? { pendingSignatures: (uid: string) => signing.list(uid) } : {}) }),
+  );
+  app.route("/", createProofRoutes({ db, assetUnit: () => { try { return chain.tx.tusdUnit(); } catch { return null; } } })); // trust receipts (api-proof.ts)
 
   // ── users ──
   app.post("/users", async (c) => {
@@ -314,6 +327,7 @@ export function createApi(deps: ApiDeps) {
       ...(signing && u.custody === "self" ? { pendingSignatures: signing.list(u.id) } : {}),
       llm: engine.llm.name,
       chain: deps.chainLabel ?? chain.provider.name,
+      ...(deps.workDeadlineSeconds !== undefined ? { workDeadlineSeconds: deps.workDeadlineSeconds } : {}),
     };
     return json(c, me);
   });
@@ -432,6 +446,7 @@ export function createApi(deps: ApiDeps) {
         running: ss.filter((s) => RUNNING_GROUP.includes(s.status)).length,
         closed: ss.filter((s) => s.status === "CLOSED").length,
         awaitingFunding: ss.filter((s) => s.status === "PLANNED" || s.status === "AWAITING_APPROVAL").length,
+        ...withRationale(g.planJson, g.budgetMicro),
       };
     });
     return json(c, out);
@@ -441,6 +456,11 @@ export function createApi(deps: ApiDeps) {
     const g = ownGoal(c.get("userId"), c.req.param("id"));
     return json(c, sessions.tree(g.id));
   });
+
+  const withRationale = (planJson: string, budgetMicro: string) => {
+    const rationale = rationaleFromPlanJson(planJson, budgetMicro, walletModeFromEnv());
+    return rationale ? { rationale } : {};
+  };
 
   // ── sessions ──
   app.post("/sessions/pause-all", async (c) => {

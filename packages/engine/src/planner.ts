@@ -1,11 +1,13 @@
 // plan_task: goal + budget + deadline + rules → validated Plan (spec §5.9) + funding preview.
 // The LLM returns JSON; we validate with PlanSchema plus business rules, and ask it to repair ONCE.
-import { PlanSchema, tusdToMicro, microToTusd, type AgentCatalogEntry, type Plan } from "@bulkhead/shared";
+import { PlanSchema, tusdToMicro, microToTusd, type AgentCatalogEntry, type Plan, type PlanRationale, type WalletMode } from "@bulkhead/shared";
 import { users, type DB } from "@bulkhead/db";
 import type { Chain, HandleResolution, HandleResolver } from "@bulkhead/chain";
 import { eq } from "drizzle-orm";
 import type { AgentMarket, LLM } from "./contracts";
 import { MASUMI_PURCHASING_WALLET_ALIAS } from "./market-masumi";
+import { buildPlanRationale } from "./captain/rationale";
+import { workDeadlineSecondsFromEnv } from "./sessions-store";
 
 export interface PlanRequest {
   userId: string;
@@ -67,18 +69,37 @@ Field formats (strict):
   e.g. ["https://defillama.com/chain/Cardano", "cardanoscan.io"]. Research sessions MUST list real, relevant sources.
   Use [] for sessions that never fetch.
 - contextFrom: array of earlier session indexes whose handbacks it should read. parent: optional earlier index.
-Reply with ONLY one JSON object, no prose, no code fences: {"sessions":[{name, role, agentType, taskType,
+Also give "rationale": one or two plain sentences for the user on WHY this split (which parts run in parallel, what
+waits for what, why the budget is divided this way). No amounts or names that are not in the plan.
+Reply with ONLY one JSON object, no prose, no code fences: {"rationale": "...", "sessions":[{name, role, agentType, taskType,
 allowWebFetch, goal, budgetTUSD, perPaymentMaxTUSD, approvalThresholdTUSD, allowedPayees, deadline, dataScope,
 parent?, contextFrom}]}.`;
+
+/**
+ * The time-box rule appended to PLANNER_SYSTEM when a work deadline is set (WORK_DEADLINE_SECONDS, default 60): each
+ * session works that long after its wallet is funded, then hands back what it has. Exported for tests.
+ */
+export function plannerWorkRule(workSeconds: number): string {
+  if (!(workSeconds > 0)) return "";
+  return `Work time (strict): you have ${workSeconds} seconds — every session works for at most ${workSeconds} s after its wallet
+is funded, then hands back whatever it has (a partial result). The whole goal should finish about ${workSeconds} s after
+funding, so prefer ONE parallel wave of small, independent sessions, each scoped to what fits in ${workSeconds} s (one or two
+sources, one payment, one hire). At most ONE dependent synthesis step (a session with contextFrom), and only when truly
+needed — it gets its own ${workSeconds} s after the first wave. Never chain more than that. Session deadlines are the
+on-chain wallet windows (set by the engine), not the work time.`;
+}
 
 /** A "$handle" payee pinned at plan time: the address the user approves is the one sessions pay. */
 export type PayeeHandle = Pick<HandleResolution, "handle" | "address" | "resolvedAt" | "unit" | "standard" | "source">;
 
 export interface Planner {
-  plan(req: PlanRequest): Promise<{ plan: Plan; fundingPreview: FundingPreview; payeeLabels: Record<string, string>; payeeHandles: Record<string, PayeeHandle>; planNotes?: string[] }>;
+  plan(req: PlanRequest): Promise<{ plan: Plan; fundingPreview: FundingPreview; payeeLabels: Record<string, string>; payeeHandles: Record<string, PayeeHandle>; planNotes?: string[]; rationale: PlanRationale }>;
 }
 
-export function createPlanner(deps: { llm: LLM; market: AgentMarket; chain: Chain; db: DB; handles?: HandleResolver }): Planner {
+export function createPlanner(deps: { llm: LLM; market: AgentMarket; chain: Chain; db: DB; handles?: HandleResolver; walletMode?: WalletMode; workSeconds?: number }): Planner {
+  const workSeconds = deps.workSeconds ?? workDeadlineSecondsFromEnv();
+  const rule = plannerWorkRule(workSeconds);
+  const system = rule ? `${PLANNER_SYSTEM}\n${rule}` : PLANNER_SYSTEM;
   return {
     async plan(req) {
       const catalog = await deps.market.catalog().catch(() => [] as AgentCatalogEntry[]);
@@ -94,7 +115,7 @@ export function createPlanner(deps: { llm: LLM; market: AgentMarket; chain: Chai
         `Return the plan JSON now.`;
 
       const messages: { role: "user" | "assistant"; content: string }[] = [{ role: "user", content: prompt }];
-      let res = await deps.llm.complete({ model: "orchestrator", system: PLANNER_SYSTEM, messages, maxTokens: 8_000 });
+      let res = await deps.llm.complete({ model: "orchestrator", system, messages, maxTokens: 8_000 });
       const vctx = { totalMicro, deadlineMs, catalog, goal: req.goal };
       let checked = validatePlan(res.text, vctx);
       if (!checked.ok) {
@@ -104,19 +125,43 @@ export function createPlanner(deps: { llm: LLM; market: AgentMarket; chain: Chai
           role: "user",
           content: `That plan is invalid:\n- ${checked.issues.join("\n- ")}\nReturn ONLY the corrected JSON object.`,
         });
-        res = await deps.llm.complete({ model: "orchestrator", system: PLANNER_SYSTEM, messages, maxTokens: 8_000 });
+        res = await deps.llm.complete({ model: "orchestrator", system, messages, maxTokens: 8_000 });
         checked = validatePlan(res.text, vctx);
         if (!checked.ok) throw new PlanError("The planner returned an invalid plan twice", checked.issues);
       }
       const { plan, payeeLabels } = checked;
       // Deterministic parallelism pass: drop chains between independent sessions (see parallelizePlan).
       const planNotes = parallelizePlan(plan);
+      if (workSeconds > 0) {
+        // Each dependent wave gets its own work time after the previous one: say what the chain costs in time.
+        const depth: number[] = [];
+        plan.sessions.forEach((s, i) => {
+          const deps_ = [...(s.contextFrom ?? []), ...(s.parent !== undefined ? [s.parent] : [])].filter((d) => d < i);
+          depth[i] = deps_.length ? 1 + Math.max(...deps_.map((d) => depth[d] ?? 0)) : 0;
+        });
+        const waves = 1 + Math.max(0, ...depth);
+        planNotes.push(
+          waves > 1
+            ? `time-boxed: ${waves} waves of work (${workSeconds} s each after funding) — later waves start when the earlier ones hand back`
+            : `time-boxed: one parallel wave — every session works ${workSeconds} s after funding, then hands back`,
+        );
+      }
       // Payee-resolution step: "$handle" → current holder address (on-chain), pinned into the goal's plan.
       const resolved = await resolvePlanHandles(plan, deps.handles ?? deps.chain.handles);
       if (!resolved.ok) throw new PlanError(`ADA Handle payee could not be resolved: ${resolved.issues.join("; ")}`, resolved.issues);
       for (const [h, r] of Object.entries(resolved.payeeHandles)) payeeLabels[h] = `${h} (${r.address.slice(0, 16)}…${r.address.slice(-6)})`;
       const fundingPreview = await previewFunding(deps, req.userId, plan);
-      return { plan, fundingPreview, payeeLabels, payeeHandles: resolved.payeeHandles, ...(planNotes.length ? { planNotes } : {}) };
+      // Plain-language "why this plan" (deterministic facts + the model's own one-line summary when valid).
+      const rationale = buildPlanRationale({
+        plan,
+        budgetTUSD: req.budgetTUSD,
+        walletMode: deps.walletMode,
+        payeeLabels,
+        catalog,
+        planNotes,
+        modelSummary: modelRationale(res.text, plan, req.budgetTUSD),
+      });
+      return { plan, fundingPreview, payeeLabels, payeeHandles: resolved.payeeHandles, ...(planNotes.length ? { planNotes } : {}), rationale };
     },
   };
 }
@@ -314,6 +359,20 @@ export function normalizePlanShape(json: unknown): unknown {
     return s;
   });
   return { ...(json as object), sessions };
+}
+
+/**
+ * The planner model's optional "rationale" string. Accepted only when it is short plain text whose numbers all appear
+ * in the plan (so it cannot invent amounts); otherwise the deterministic summary is used. Exported for tests.
+ */
+export function modelRationale(text: string, plan: Plan, budgetTUSD: string): string | null {
+  const json = extractJson(text) as { rationale?: unknown } | undefined;
+  const r = typeof json?.rationale === "string" ? json.rationale.replace(/\s+/g, " ").trim() : "";
+  if (!r || r.length > 400 || /[<>{}]/.test(r)) return null;
+  const known = `${JSON.stringify(plan)} ${budgetTUSD} ${plan.sessions.length}`;
+  const nums = r.match(/\d+(?:\.\d+)?/g) ?? [];
+  if (nums.some((n) => !known.includes(n))) return null;
+  return r;
 }
 
 function extractJson(text: string): unknown {

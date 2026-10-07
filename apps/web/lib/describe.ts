@@ -87,7 +87,9 @@ export function describeEvent(e: BulkheadEvent, rate: string): { tone: Tone; tex
     case "session_stalled":
       return { tone: "warn", text: `No progress for ${Math.round(Number(d.idleMs ?? 0) / 60_000)} min · captain woken, escalation ${s(d.escalation)}` };
     case "goal_completed":
-      return { tone: s(d.outcome) === "all_done" ? "good" : "warn", text: `Goal complete: ${s(d.doneMet)}/${s(d.total)} session(s) met their definition of done` };
+      return { tone: s(d.outcome) === "all_done" ? "good" : "warn", text: `Goal complete: ${s(d.doneMet)}/${s(d.total)} session(s) met their definition of done${d.timeBoxed ? ` · time-boxed${d.workSeconds ? ` to ${s(d.workSeconds)} s of work` : ""}` : ""}` };
+    case "work_deadline_reached":
+      return { tone: "warn", text: `Work time${d.workSeconds ? ` (${s(d.workSeconds)} s)` : ""} is up · partial handback collected, closing` };
     case "captain_action": {
       const input = (d.input ?? {}) as Record<string, unknown>;
       const what = d.tool === "message_session" ? `message to session: ${s(input.text)}` : d.tool === "report_to_user" ? `report: ${s(input.text)}` : `${s(d.tool).replace(/_/g, " ")}${input.sessionId ? ` ${s(input.sessionId)}` : ""}`;

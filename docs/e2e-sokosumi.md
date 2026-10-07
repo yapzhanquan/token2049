@@ -94,3 +94,67 @@ The worker is already running with paid Tasks on.
 |---|---|---|
 | Standard API | 127.0.0.1:4200 | `apps/sokosumi-worker/.local/standard-api.log`, `.err.log` |
 | Sokosumi worker | see final report (node PID in the first log line) | `apps/sokosumi-worker/.local/worker.log`, `.err.log`; earlier runs `worker.exec-only.log`, `worker.paid-run1.log` |
+
+---
+
+# Sokosumi hiring market (`MARKET=sokosumi`): hire agents with hackathon-org CREDITS (preprod, 2026-10-07)
+
+Labels: **VERIFIED** = observed by us in this run; **REPORTED** = stated by another component; **INFERRED** = our reading.
+Credits are **off-chain** Sokosumi platform credits: no Cardano transaction exists for them, and none is claimed.
+Sources: `masumi` skill (`references/sokosumi-api-reference.md`, `sokosumi-marketplace.md`, `api-debug-recipes.md`),
+installed Sokosumi CLI 1.0.0 (`api/http-client.js`, `api/services/{agent,job}-service.js`, `api/models/*`), and the live
+`https://api.preprod.sokosumi.com/v1/openapi.json` (public, read 2026-10-07).
+
+## Contract (engine `packages/engine/src/market-sokosumi.ts`)
+
+| rule | how | label |
+|---|---|---|
+| Workspace | every request sends `X-Organization-Slug: token2049-origins-hackathon-2026-nws2r7`, except the read-only control read `GET /v1/users/me/credits` (no slug = the key's own context wallet). No slug/org id configured → the market refuses to start | VERIFIED (unit tests assert the header on every call; live run below) |
+| Pre-hire | `GET /v1/users/me/organizations/{orgId}/credits` must answer `scope: "organization"` with spendable ≥ the agent's credits; personal wallet (when the context read answers `scope: "personal"`) and every other org of the user are read as controls | VERIFIED live |
+| Job must be in the org | the created job's `organizationId` must equal `01a109d1-32a9-71a3-a0e3-658b2a7987cd`, else incident + market disabled | VERIFIED live (check passed) |
+| Post-hire | re-read org + personal + other orgs after creation and after completion; deltas recorded; any personal/other-org decrease → `sokosumi_incident` error event + market disabled (kv `sokosumi:disabled`) | VERIFIED live (afterHire); unit-tested |
+| Mandate cap | `maxCredits = min(floor(min(remaining budget, per-payment max) × SOKOSUMI_CREDITS_PER_TUSDM), SOKOSUMI_MAX_CREDITS_PER_HIRE)`; default rate 100 credits per tUSDM (skill: 1 credit ≈ $0.01), ceiling 10; agents priced above it are refused before any request | unit-tested; live POST sent maxCredits 2 |
+| Accounting | runner writes a `payments` row: payee `sokosumi-credits:<slug>`, `txHash` NULL, status `confirmed`, amountMicro = tUSD-equivalent (credits ÷ rate); event `agent_job_paid` with `kind: "credits"` | unit/e2e-tested (offline) |
+| Evidence / DoD | `hire_agent` done = job completed + recorded credit row + handback `job { jobId, resultHash }` where resultHash = sha256(raw UTF-8 result) (MIP-004 raw rule, no nonce) | unit/e2e-tested (offline) |
+
+## Live read-only checks
+
+| check | result | label |
+|---|---|---|
+| `GET /v1/agents?limit=100` | 92 entries; 75 credit-priced (x402/OpenAPI and 0-credit dev agents skipped); 29 at ≤ 2 credits | VERIFIED |
+| `GET /v1/agents/cmmdca97d000304icco9htf5n/input-schema` ("Expose: Advanced Web Research") | `info` (none), `research_question` (textarea, required), `additional_context` (textarea, optional) | VERIFIED |
+| `GET /v1/agents/cmnsp3iue000404l1zmzmgnb0/input-schema` ("Statista Key Insight (Bansumi)") | HTTP 422 "Failed to parse input schema" → not hireable through the API | VERIFIED |
+| Hackathon org balance | 58,950 (05:31Z) → 58,700 (05:33Z, before our hire): the pool is shared with other hackathon members, so org deltas are recorded, not asserted | VERIFIED |
+| `GET /v1/users/me/credits` without slug | 05:31Z: answered `scope: "organization"` 58,950 (the then key's context); 05:33Z: `scope: "personal"`, 3,250 | VERIFIED |
+| Other org "Bulkhead" (`01a1146d-…20dc`) | 250 | VERIFIED |
+
+## The single test hire (1-credit agent, maxCredits 2, hackathon org)
+
+`packages/engine/scripts/sokosumi-live.ts --hire cmmdca97d000304icco9htf5n "How can Cardano stablecoins (e.g. USDM) be used for settlement of B2B supplier payments? Keep it brief." 0.02`
+
+| item | value | label |
+|---|---|---|
+| Agent | Expose: Advanced Web Research, listed 1 credit | VERIFIED |
+| Request | `POST /v1/agents/cmmdca97d000304icco9htf5n/jobs` with `X-Organization-Slug: token2049-origins-hackathon-2026-nws2r7`, `maxCredits: 2`, `inputData: { research_question }` | VERIFIED (engine code path) |
+| Job id | `01a114e1-8fb6-760a-a9e6-e67b40278cd8` | VERIFIED (201 response) |
+| Job organization | = hackathon org id (incident check passed) | VERIFIED |
+| Hackathon org balance | 58,700 → 58,699 (Δ −1) right after creation | VERIFIED |
+| Personal balance | 3,250 → 3,250 (Δ 0), scope `personal` | VERIFIED |
+| Other org (Bulkhead) | 250 → 250 | VERIFIED |
+| Result + result hash | **completed**: 6,348-char result, sha256 (raw UTF-8) `d44732fbdb07a5143aa39503371d8bdf3789b64366598ec1a87db304252615c0`. Read via `--resume` after the user replaced the API key (the earlier 401s were the old key) | VERIFIED |
+| Credits charged at completion (Sokosumi `job.credits`) | unknown until the job is read again | — |
+
+To finish when a valid key is in `bulkhead/.env` (read-only, no new spend; record kept in `bulkhead/.local/sokosumi-live.json`, run log in `.local/sokosumi-live-hire-1.log`, both gitignored):
+
+```sh
+pnpm --filter @bulkhead/engine exec tsx --env-file-if-exists=../../.env scripts/sokosumi-live.ts --resume 01a114e1-8fb6-760a-a9e6-e67b40278cd8
+```
+
+It prints the final status, `resultHash` = sha256(raw UTF-8 result), Sokosumi's own `resultHash`, and the org/personal deltas after completion.
+
+## Enabling it in the running engine
+
+Set `MARKET=sokosumi` (catalog = mock + Sokosumi) or `MARKET=masumi,sokosumi` in `bulkhead/.env`, then restart the engine
+(`pnpm dev:stable` must be restarted; it was not restarted by this change). Sokosumi agents appear in `GET /agents` as
+`sokosumi:<agent id>` with `source: "sokosumi"`, `priceTUSD` = credits ÷ rate. A plan lists the agent id in the hire
+session's `allowedPayees`; it is allowlisted as the owner's own treasury address (credits never go on-chain).

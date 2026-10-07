@@ -10,6 +10,7 @@ import { kv, type DB } from "@bulkhead/db";
 import { eq } from "drizzle-orm";
 import type { Captain, EventBus, SessionManager } from "../contracts";
 import { CrewWatchdog, type SessionHealth, type WatchdogOptions } from "./watchdog";
+import { workGraceMsFromEnv } from "../sessions-store";
 
 /** The captain's own bookkeeping events: never classified (that would loop). */
 const SELF_EVENTS: readonly EventType[] = ["captain_woken", "captain_absorbed", "captain_action", "captain_report"];
@@ -31,6 +32,8 @@ export interface WakeFilterOptions {
   watchdog?: WatchdogOptions;
   /** How often the watchdog scans RUNNING sessions for stalls (ms). Default min(15 s, stallMs / 4). */
   stallCheckMs?: number;
+  /** How often the watchdog checks work deadlines (ms, default 1 s). */
+  workCheckMs?: number;
 }
 
 export class WakeFilter {
@@ -46,7 +49,9 @@ export class WakeFilter {
   private readonly absorbFlushMs: number;
   private readonly replayLimit: number;
   private readonly stallCheckMs: number;
+  private readonly workCheckMs: number;
   private stallTimer: NodeJS.Timeout | null = null;
+  private workTimer: NodeJS.Timeout | null = null;
   readonly watchdog: CrewWatchdog;
 
   constructor(
@@ -56,8 +61,12 @@ export class WakeFilter {
     this.debounceMs = opts.debounceMs ?? 300;
     this.absorbFlushMs = opts.absorbFlushMs ?? 2_000;
     this.replayLimit = opts.replayLimit ?? 50;
-    this.watchdog = new CrewWatchdog({ bus: deps.bus, db: deps.db }, opts.watchdog);
+    // Work deadline: the watchdog acts through the SessionManager (timeBox) when it offers one.
+    const s = deps.sessions;
+    const work = opts.watchdog?.work ?? (s?.workDeadlineOf && s.timeBox ? { deadlineOf: (id: string) => s.workDeadlineOf!(id), timeBox: (id: string, why: string) => s.timeBox!(id, why), graceMs: workGraceMsFromEnv() } : undefined);
+    this.watchdog = new CrewWatchdog({ bus: deps.bus, db: deps.db }, { ...opts.watchdog, ...(work ? { work } : {}) });
     this.stallCheckMs = opts.stallCheckMs ?? Math.max(50, Math.min(15_000, Math.floor(this.watchdog.stallMs / 4)));
+    this.workCheckMs = Math.max(20, opts.workCheckMs ?? 1_000);
     const c = deps.captain as Partial<HealthAwareCaptain>;
     if (typeof c.setHealthSource === "function") c.setHealthSource((id) => this.watchdog.health(id));
   }
@@ -74,6 +83,16 @@ export class WakeFilter {
       }
     }, this.stallCheckMs);
     this.stallTimer.unref?.();
+    if (this.watchdog.work) {
+      this.workTimer = setInterval(() => {
+        try {
+          this.watchdog.scanWork();
+        } catch {
+          /* DB closed during shutdown */
+        }
+      }, this.workCheckMs);
+      this.workTimer.unref?.();
+    }
   }
 
   async stop(): Promise<void> {
@@ -81,6 +100,8 @@ export class WakeFilter {
     this.unsubscribe = null;
     if (this.stallTimer) clearInterval(this.stallTimer);
     this.stallTimer = null;
+    if (this.workTimer) clearInterval(this.workTimer);
+    this.workTimer = null;
     await this.idle();
     this.flushAbsorbed();
   }
@@ -159,7 +180,7 @@ export class WakeFilter {
     if (p.timer) clearTimeout(p.timer);
     this.pending.delete(key);
     // user messages and decisions take priority as the primary trigger; the rest ride along.
-    const prio: EventType[] = ["user_message", "decision_opened", "payment_rejected", "session_looping", "session_stalled", "goal_completed", "handback_submitted"];
+    const prio: EventType[] = ["user_message", "decision_opened", "payment_rejected", "session_looping", "session_stalled", "goal_completed", "work_deadline_reached", "handback_submitted"];
     const sorted = [...p.events].sort((a, b) => {
       const pa = prio.indexOf(a.type), pb = prio.indexOf(b.type);
       return (pa < 0 ? 99 : pa) - (pb < 0 ? 99 : pb) || a.id - b.id;

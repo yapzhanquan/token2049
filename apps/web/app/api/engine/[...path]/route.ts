@@ -16,11 +16,13 @@ const ALLOW: [string, RegExp][] = [
   ["POST", /^\/goals$/],
   ["POST", new RegExp(`^/goals/${SEG}/approve$`)],
   ["GET", new RegExp(`^/goals/${SEG}/tree$`)],
+  ["GET", new RegExp(`^/goals/${SEG}/proof$`)], // trust receipt (read-only)
   ["POST", /^\/sessions\/pause-all$/],
   ["GET", new RegExp(`^/sessions/${SEG}$`)],
   ["POST", new RegExp(`^/sessions/${SEG}/(pause|resume|kill|extend|raise|narrow)$`)],
   ["POST", new RegExp(`^/sessions/${SEG}/messages$`)],
   ["GET", new RegExp(`^/sessions/${SEG}/peek$`)],
+  ["GET", new RegExp(`^/sessions/${SEG}/proof$`)], // trust receipt (read-only)
   ["POST", new RegExp(`^/payments/${SEG}/(approve|reject)$`)],
   ["GET", /^\/decisions$/],
   ["POST", new RegExp(`^/decisions/${SEG}$`)],
@@ -32,6 +34,11 @@ const ALLOW: [string, RegExp][] = [
   ["GET", /^\/logbook$/],
   ["GET", /^\/activity$/],
   ["GET", /^\/events\/stream$/],
+  // Bridge (captain digest): Bearings + Ahoy.
+  ["GET", /^\/bearings$/],
+  ["POST", /^\/bearings\/file$/],
+  ["GET", /^\/ahoy$/],
+  ["POST", /^\/ahoy\/seen$/],
   ["POST", new RegExp(`^/signatures/${SEG}$`)],
 ];
 

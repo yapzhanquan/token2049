@@ -25,8 +25,11 @@ export interface AppliedVaultLike {
 export interface Metadata674 {
   session_id: string;
   log_sha256: string;
+  /** sha256(utf8(handback text)) — the session's result, anchored on-chain (trust receipts). */
   handback_sha256: string;
   status: string;
+  /** The session's goal id (trust receipts). */
+  goal_id?: string;
 }
 
 export interface VaultOps {

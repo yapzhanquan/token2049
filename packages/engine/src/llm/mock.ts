@@ -26,7 +26,11 @@ export class MockLLM implements LLM {
     const first = textOf(args.messages[0]);
     let res: LLMResponse;
     let kind: MockCallRecord["kind"] = "other";
-    if (args.model === "subagent") {
+    if (/<(report|bearings|ahoy)_facts>/.test(first)) {
+      // Captain wording (wording.ts): re-word the deterministic draft. The mock keeps the draft's facts verbatim.
+      const draft = /\nDraft: (.*)\n/.exec(first)?.[1] ?? "";
+      res = this.reply(draft.trim(), []);
+    } else if (args.model === "subagent") {
       kind = "subagent";
       res = this.reply("Working on it.", []);
     } else if (first.includes("<planning_request>")) {
@@ -124,8 +128,13 @@ export class MockLLM implements LLM {
       case "goal_completed": {
         if (step > 0) return ["Done.", []];
         const met = sessions.filter((x) => x.closeStatus === "COMPLETED").length;
-        return ["", [report(`Goal complete: ${met}/${sessions.length} session(s) met their definition of done.`)]];
+        const secs = Number(t.data.workSeconds ?? 0);
+        const boxed = t.data.timeBoxed === true ? ` Time-boxed to ${secs ? `${secs} s` : "the work time"} of work; partial results are marked.` : "";
+        return ["", [report(`Goal complete: ${met}/${sessions.length} session(s) met their definition of done.${boxed}`)]];
       }
+      case "work_deadline_reached":
+        // The watchdog already collected the partial handback and closes the session: nothing to do, no replacement.
+        return ["Work time is up for that session; its partial handback is collected and it is closing.", []];
       case "tainted":
         return step === 0 ? ["", [report(`Session ${label} read untrusted web content; its spending now needs your approval.`)]] : ["Done.", []];
       case "deposit_seen":
@@ -186,6 +195,7 @@ export function mockPlan(req: { goal?: string; budgetTUSD?: string; deadline?: s
   };
   const t = microToTusd;
   return {
+    rationale: "Desk research and the agent hire start at once; the summary purchase waits for the research because it pays based on those findings.",
     sessions: [
       {
         name: "Desk research",

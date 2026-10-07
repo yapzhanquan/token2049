@@ -94,8 +94,10 @@ export interface Live {
   reconnecting: boolean;
   /** Id of the newest event seen (SSE resume point). */
   lastEventId: number;
+  /** Every event from the stream (except llm_usage), in order — for stores that keep more than `recent`. Returns unsubscribe. */
+  subscribe: (fn: (e: BulkheadEvent) => void) => () => void;
 }
-export const LiveContext = createContext<Live>({ version: 0, bump: () => {}, recent: [], connected: false, reconnecting: false, lastEventId: 0 });
+export const LiveContext = createContext<Live>({ version: 0, bump: () => {}, recent: [], connected: false, reconnecting: false, lastEventId: 0, subscribe: () => () => {} });
 export const useLive = () => useContext(LiveContext);
 
 export function useLiveStream(): Live {
@@ -106,6 +108,13 @@ export function useLiveStream(): Live {
   const [lastEventId, setLastEventId] = useState(0);
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const bump = useCallback(() => setVersion((v) => v + 1), []);
+  const subs = useRef(new Set<(e: BulkheadEvent) => void>());
+  const subscribe = useCallback((fn: (e: BulkheadEvent) => void) => {
+    subs.current.add(fn);
+    return () => {
+      subs.current.delete(fn);
+    };
+  }, []);
 
   useEffect(() => {
     let es: EventSource | null = null;
@@ -133,6 +142,13 @@ export function useLiveStream(): Live {
           }
           if (e.type === "llm_usage") return; // routine
           setRecent((r) => [...r.slice(-49), e]);
+          for (const fn of subs.current) {
+            try {
+              fn(e);
+            } catch {
+              /* a subscriber must never break the stream */
+            }
+          }
         } catch {
           return;
         }
@@ -160,7 +176,7 @@ export function useLiveStream(): Live {
     };
   }, [bump]);
 
-  return { version, bump, recent, connected, reconnecting, lastEventId };
+  return { version, bump, recent, connected, reconnecting, lastEventId, subscribe };
 }
 
 /**

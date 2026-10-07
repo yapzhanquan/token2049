@@ -118,6 +118,19 @@ export const DEFINITION_OF_DONE: Record<TaskType, string> = {
 /** A handback failing its definition of done is returned once; the second failure → FAILED → CLOSING. */
 export const MAX_DONE_ATTEMPTS = 2;
 
+// ───────────────────────── Work deadline (time-boxed crew) ─────────────────────────
+// The crew's WORKING time is separate from the on-chain safety windows (vault expiry, MPS escrow times):
+// every session gets WORK_DEADLINE_SECONDS (default 60) from the moment it becomes RUNNING (vault funded).
+// At the deadline the silo hands back whatever it has, flagged PARTIAL_TIME_LIMIT_FLAG; the captain's
+// watchdog collects anything still open and the session closes (Revoke) right away.
+export const WORK_DEADLINE_DEFAULT_SECONDS = 60;
+/** Flag on a handback submitted because the work deadline was reached (by the silo or the orchestrator). */
+export const PARTIAL_TIME_LIMIT_FLAG = "partial: time limit";
+/** closeStatus of a session whose partial (time-limit) handback did not meet the definition of done. */
+export const TIMEBOXED_CLOSE_STATUS = "TIMEBOXED";
+export const isTimeLimitPartial = (h: { flags?: readonly string[] } | null | undefined): boolean =>
+  !!h?.flags?.some((f) => f.trim().toLowerCase().startsWith(PARTIAL_TIME_LIMIT_FLAG));
+
 // ───────────────────────────── Planning ─────────────────────────────
 // What the orchestrator LLM must return (spec §5.9). Amounts are decimal tUSD strings.
 const TusdString = z.string().regex(/^\d+(\.\d{1,6})?$/);
@@ -211,7 +224,9 @@ export const EVENT_TYPES = [
   "session_stalled", // deterministic watchdog: a RUNNING session made no progress for too long
   "session_looping", // deterministic watchdog: N consecutive failed / repeated tool calls
   "goal_completed", // every session of the goal is CLOSED → the captain verifies + reports
+  "work_deadline_reached", // a session's work time (WORK_DEADLINE_SECONDS) ran out: partial handback collected, session closes
   "error",
+  "treasury_refill", // treasury autopilot moved tUSDM + tADA from the funding account to a delegated treasury {from,to,amounts,tx,reason,status}
 ] as const;
 export type EventType = (typeof EVENT_TYPES)[number];
 
@@ -236,7 +251,12 @@ export interface TaskSpec {
   budgetTUSD: string;
   perPaymentMaxTUSD: string;
   allowedPayees: { id: string; label: string; address: string }[];
+  /** Vault expiry (POSIX ms): the on-chain safety window, NOT the working time. */
   deadline: number;
+  /** Work deadline (POSIX ms): hand back before this; at it the silo submits a partial handback. Absent = no limit. */
+  workDeadline?: number;
+  /** The configured working time in seconds (WORK_DEADLINE_SECONDS), for the prompt. */
+  workSeconds?: number;
   /** monitor only: what to watch (from the plan), e.g. { kind: "deposit", address, minTUSD }. */
   watch?: Record<string, unknown>;
 }
@@ -356,6 +376,7 @@ export const WAKE_EVENTS: readonly EventType[] = [
   "topup_confirmed",
   "deadline_near",
   "goal_completed", // the whole crew is done → verify + final report
+  "work_deadline_reached", // work time ran out: the watchdog collected the handback and closes the session
   "user_message",
 ];
 
@@ -444,6 +465,8 @@ export interface TreeNode {
   lines: string[]; // the 2 short lines under the label (spec §6.4)
   startedAt?: number;
   endedAt?: number;
+  /** Running sessions: when the crew's work time ends (startedAt + WORK_DEADLINE_SECONDS). */
+  workDeadlineAt?: number;
   tokensUsed?: number;
   spentMicro?: string;
   budgetMicro?: string;
@@ -504,6 +527,8 @@ export const ENGINE_ROUTES = {
 export * from "./api";
 export * from "./staking";
 export * from "./settlement";
+export * from "./proof";
+export * from "./bridge";
 
 export const NETWORK = "preprod" as const;
 export const EXPLORER = "https://preprod.cardanoscan.io";

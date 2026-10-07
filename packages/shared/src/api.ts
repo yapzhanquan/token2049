@@ -3,6 +3,7 @@
 // Units: amounts are decimal strings of micro-tUSD (`…Micro`) or lovelace (`…Lovelace`) — bigint-safe
 // JSON. Request bodies that a person types use decimal tUSD strings (`…TUSD`, e.g. "1.5").
 import type { BulkheadEvent, ContextIn, Decision, Glyph, Handback, Plan, SessionStatus, TaskType, TreeDTO, WalletMode } from "./index";
+import type { PlanRationale } from "./bridge";
 
 export type Custody = "custodial" | "self";
 
@@ -81,6 +82,8 @@ export interface MeDTO {
   llm?: "anthropic" | "openai" | "mock";
   /** "fake" = offline FakeChain demo (NOT on-chain). */
   chain?: string;
+  /** WORK_DEADLINE_SECONDS: the crew's working time per session after its vault is funded (0 = no limit). */
+  workDeadlineSeconds?: number;
   /** Web fixture engine only. */
   mode?: "fixture";
 }
@@ -165,6 +168,8 @@ export interface GoalSummary {
   /** Sessions still waiting for their funding tx (PLANNED / AWAITING_APPROVAL, e.g. a child spawn the treasury
    * could not cover, or a self-custody signature that was never given). > 0 → the UI re-offers "Approve & start". */
   awaitingFunding?: number;
+  /** Why the planner split the goal this way (sessions, parallel vs dependent, budget split, guards). */
+  rationale?: PlanRationale;
 }
 
 export interface FundingPreview {
@@ -187,6 +192,8 @@ export interface PlanResponse {
   goalId: string;
   plan: Plan;
   fundingPreview: FundingPreview;
+  /** Why the planner split the goal this way. */
+  rationale?: PlanRationale;
 }
 
 /** POST /goals/:id/approve — body {} (or SignedBody on the second, signed call). */
@@ -469,6 +476,8 @@ export interface HealthDTO {
   simulatedChain?: boolean;
   mode?: "fixture";
   at?: number;
+  /** WORK_DEADLINE_SECONDS (0 = no limit). */
+  workDeadlineSeconds?: number;
 }
 
 export type { TreeDTO, Decision, BulkheadEvent };

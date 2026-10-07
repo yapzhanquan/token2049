@@ -138,6 +138,7 @@ describe("sweep", () => {
     expect(p.validityStart).toBeUndefined();
     expect(witnesses(r.cborHex)).toEqual([{ keyHash: env.captain.keyHash, valid: true }]);
     expect(metadataOf(r.cborHex)["674"]).toEqual({ msg: ["Bulkhead session close"], ...meta });
+    expect(metadataOf(r.cborHex)["674"]).not.toHaveProperty("goal_id");
   });
 
   it("owner path fails clearly before expiry, works after with invalidBefore = expirySlot", async () => {
@@ -149,9 +150,10 @@ describe("sweep", () => {
     );
     provider.tipSlot = expiry + 1;
     try {
-      const r = await tx.sweep({ sessionId: "w2", signer: "owner", toAddress: env.treasury.address, metadata674: meta });
+      const r = await tx.sweep({ sessionId: "w2", signer: "owner", toAddress: env.treasury.address, metadata674: { ...meta, goal_id: "g_trust-receipt" } });
       const p = parseTx(r.cborHex);
       expect(p.validityStart).toBe(expiry);
+      expect(metadataOf(r.cborHex)["674"]).toEqual({ msg: ["Bulkhead session close"], ...meta, goal_id: "g_trust-receipt" }); // trust receipts
       expect(witnesses(r.cborHex)).toEqual([{ keyHash: env.treasury.keyHash, valid: true }]);
     } finally {
       provider.tipSlot = TIP_SLOT;

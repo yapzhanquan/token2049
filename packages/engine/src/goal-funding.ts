@@ -11,6 +11,11 @@
 //    can cover them, and otherwise surface ONE clear `error` event { kind: "funding_stalled" } with the exact
 //    shortfall (asset + amount + treasury address). The same message is never re-emitted (persisted in kv), so
 //    restarts don't spam the log.
+//  - Treasury autopilot (treasury-autopilot.ts): for its target accounts (delegated custodial users) a shortfall is
+//    not a stall — the reconciler asks the autopilot to refill the treasury from the funding account (inside the
+//    24 h standing cap), waits for the refill to confirm and funds the goal in the SAME pass. Only a refill the
+//    autopilot cannot make (cap reached, source too low) becomes the one `funding_stalled` notice, with the exact
+//    amount still needed.
 import { eq, inArray } from "drizzle-orm";
 import { goals, kv, sessions as sessionsT, users, type DB } from "@bulkhead/db";
 import type { Chain } from "@bulkhead/chain";
@@ -19,6 +24,7 @@ import type { EventBus, SessionManager } from "./contracts";
 import { FundingError, fundingNeed, fundingShortfall, sessionFloatFor, type RuntimeSessionManager } from "./sessions";
 import type { RuntimeConfig } from "./sessions-store";
 import { parseVaultParams } from "./vault";
+import { autopilotFor } from "./treasury-autopilot";
 
 export interface GoalFundingDeps {
   db: DB;
@@ -93,7 +99,7 @@ async function startGoalOnce(deps: GoalStartDeps, goalId: string, extra: Record<
 
 export type AutoFundResult =
   | { ok: true; fundingTx: string | null; sessionIds: string[] }
-  | { ok: false; reason: "self_custody" | "outside_mandate" | "insufficient_funds" | "funding_failed"; error: string };
+  | { ok: false; reason: "self_custody" | "outside_mandate" | "insufficient_funds" | "funding_failed"; error: string; autopilot?: "refilling" };
 
 /** Fund a delegated (API) goal at creation, inside its mandate. On a shortfall the goal stays approved and the
  * reconciler retries once the treasury is topped up. */
@@ -113,6 +119,13 @@ export async function autoFundGoal(deps: GoalStartDeps, goalId: string): Promise
     await startGoal(deps, goalId, { delegated: true, by: "auto-fund" });
   } catch (e) {
     if (e instanceof FundingError) {
+      const ap = autopilotFor(db);
+      if (ap?.covers(user)) {
+        // Not a stall: the treasury autopilot refills this account and the reconciler funds the goal right after.
+        bus.emit("progress", { goalId, data: { kind: "log", level: "info", text: "treasury short for this goal — the treasury autopilot is refilling it; funding follows automatically once the refill confirms" } });
+        ap.nudge();
+        return { ok: false, reason: "insufficient_funds", error: e.message, autopilot: "refilling" };
+      }
       noteStall(deps, goalId, "insufficient_funds", e.message, e.details());
       return { ok: false, reason: "insufficient_funds", error: e.message };
     }
@@ -155,6 +168,8 @@ export interface GoalReconciler {
   stop(): void;
   /** One pass (exposed for tests / boot). */
   tick(): Promise<GoalReconcileReport>;
+  /** Run a pass now, or right after the one in progress (treasury autopilot: a refill confirmed / a shortfall seen). */
+  nudge(): void;
 }
 
 export function createGoalReconciler(deps: GoalFundingDeps): GoalReconciler {
@@ -163,6 +178,8 @@ export function createGoalReconciler(deps: GoalFundingDeps): GoalReconciler {
   let soon: ReturnType<typeof setTimeout> | null = null;
   let offWatcher: (() => void) | null = null;
   let running: Promise<GoalReconcileReport> | null = null;
+  let again = false;
+  let stopped = false;
 
   const unitOrUndefined = () => {
     try {
@@ -181,6 +198,30 @@ export function createGoalReconciler(deps: GoalFundingDeps): GoalReconciler {
         return { tusdMicro: BigInt(r.budgetMicro), extraLovelace: float > allowance ? float : allowance };
       }),
     );
+  }
+
+  /**
+   * Treasury autopilot for a shortfall of this goal's (custodial) owner: refill, wait for confirmation, then the
+   * caller funds in the same pass. null = the autopilot does not cover this user (normal stall path).
+   */
+  async function viaAutopilot(user: UserRow, goalId: string, needTusdMicro: bigint, needLovelace: bigint, ids: string[]): Promise<"ok" | "waiting" | "blocked" | null> {
+    const ap = autopilotFor(db);
+    if (!ap || user.custody !== "custodial" || !ap.covers(user)) return null;
+    const r = await ap.ensure({ userId: user.id, needTusdMicro, needLovelace, goalId, reason: `goal ${goalId} funding shortfall`, wait: true });
+    if (r.status === "sufficient" || r.status === "refilled") return "ok";
+    if (r.status === "pending") return "waiting"; // still confirming: the next pass (or the confirmation nudge) funds it
+    if (r.status === "blocked") {
+      noteStall(deps, goalId, "autopilot_blocked", r.message, {
+        autopilot: r.reason,
+        shortTusdMicro: r.neededTusdMicro.toString(),
+        shortLovelace: r.neededLovelace.toString(),
+        treasuryAddress: user.treasuryAddress,
+        assetUnit: unitOrUndefined(),
+        sessionIds: ids,
+      });
+      return "blocked";
+    }
+    return null;
   }
 
   async function reconcileGoal(g: GoalRow, report: GoalReconcileReport): Promise<void> {
@@ -204,8 +245,13 @@ export function createGoalReconciler(deps: GoalFundingDeps): GoalReconciler {
       if (bal) {
         const e = fundingShortfall({ haveLovelace: bal.lovelace, haveTusdMicro: bal.tusdMicro, needLovelace: need.lovelace, needTusdMicro: need.tusdMicro, myrPerTusd: config.myrPerTusd, treasuryAddress: user.treasuryAddress, assetUnit: unitOrUndefined() });
         if (e) {
-          if (noteStall(deps, g.id, "insufficient_funds", `${unfunded.length} session wallet(s) of this goal are waiting for funding. ${e.message}`, { ...e.details(), sessionIds: ids })) report.stalled.push(g.id);
-          return;
+          const auto = await viaAutopilot(user, g.id, need.tusdMicro, need.lovelace, ids);
+          if (auto === "blocked") report.stalled.push(g.id);
+          if (auto !== "ok") {
+            if (auto === null && noteStall(deps, g.id, "insufficient_funds", `${unfunded.length} session wallet(s) of this goal are waiting for funding. ${e.message}`, { ...e.details(), sessionIds: ids })) report.stalled.push(g.id);
+            return;
+          }
+          // refilled + confirmed by the autopilot: fund below, in this same pass
         }
       }
     }
@@ -215,8 +261,23 @@ export function createGoalReconciler(deps: GoalFundingDeps): GoalReconciler {
         report.stalled.push(g.id);
       return;
     }
+    const fundNow = async () => (needsPlanStart ? (await startGoal(deps, g.id, { by: "goal-reconciler" }), sessions.list({ goalId: g.id }).map((s) => s.id)) : await sessions.fundUnfunded(g.id));
     try {
-      const funded = needsPlanStart ? (await startGoal(deps, g.id, { by: "goal-reconciler" }), sessions.list({ goalId: g.id }).map((s) => s.id)) : await sessions.fundUnfunded(g.id);
+      let funded: string[];
+      try {
+        funded = await fundNow();
+      } catch (e) {
+        // The chain said "not enough" (fees, a plan start with no rows yet): one autopilot refill, then one retry.
+        if (!(e instanceof FundingError)) throw e;
+        const auto = await viaAutopilot(user, g.id, e.needTusdMicro, e.needLovelace, ids);
+        if (auto === "blocked") {
+          report.stalled.push(g.id);
+          return;
+        }
+        if (auto === "waiting") return;
+        if (auto === null) throw e;
+        funded = await fundNow();
+      }
       if (funded.length) {
         report.funded.push(g.id);
         clearStall(db, g.id);
@@ -233,6 +294,7 @@ export function createGoalReconciler(deps: GoalFundingDeps): GoalReconciler {
 
   const rec: GoalReconciler = {
     start() {
+      stopped = false;
       if (timer || offWatcher) return;
       const every = config.goalReconcileMs ?? 60_000;
       if (every > 0) {
@@ -256,6 +318,7 @@ export function createGoalReconciler(deps: GoalFundingDeps): GoalReconciler {
       }
     },
     stop() {
+      stopped = true;
       if (timer) clearInterval(timer);
       if (soon) clearTimeout(soon);
       timer = null;
@@ -278,8 +341,17 @@ export function createGoalReconciler(deps: GoalFundingDeps): GoalReconciler {
         return report;
       })().finally(() => {
         running = null;
+        if (again && !stopped) {
+          again = false;
+          void rec.tick().catch(() => undefined);
+        }
       });
       return running;
+    },
+    nudge() {
+      if (stopped) return;
+      if (running) again = true;
+      else void rec.tick().catch(() => undefined);
     },
   };
   return rec;

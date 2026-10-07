@@ -6,17 +6,18 @@
 // treasury lacked tUSD): the engine answers 409 insufficient_funds with a precise message, the bar
 // offers "Top up RM50", and re-enables Approve once the top-up has confirmed on preprod.
 import { useEffect, useRef, useState } from "react";
-import type { GoalSummary, MeDTO } from "@bulkhead/shared";
+import type { GoalSummary, MeDTO, TreeDTO } from "@bulkhead/shared";
 import { ApiError, postSigned, useResource } from "@/lib/client";
 import { useWalletSigner } from "@/lib/wallet-context";
 import { myr, tusd } from "@/lib/money";
 import { UNFUNDED_GOAL_TEXT } from "@/lib/describe";
 import { TopUpDialog } from "./TopUpDialog";
+import { PlanRationale, rationaleOf, stepsFromTree } from "./PlanRationale";
 
 /** Max time to wait for a top-up deposit before re-enabling Approve anyway. */
 const TOPUP_WAIT_MS = 4 * 60_000;
 
-export function PlannedGoalBar({ goal, rate, onStarted }: { goal: GoalSummary; rate: string; onStarted: () => void }) {
+export function PlannedGoalBar({ goal, rate, onStarted, tree }: { goal: GoalSummary; rate: string; onStarted: () => void; tree?: TreeDTO | null }) {
   const signer = useWalletSigner();
   const { data: me, reload: reloadMe } = useResource<MeDTO>("/me");
   const [busy, setBusy] = useState(false);
@@ -87,6 +88,14 @@ export function PlannedGoalBar({ goal, rate, onStarted }: { goal: GoalSummary; r
           {busy ? "Starting…" : waiting ? "Waiting for top-up…" : `Approve & start (${myr(budget, rate)})`}
         </button>
       </div>
+      {!unfunded && (
+        <details className="text-[12.5px]" open>
+          <summary className="cursor-pointer mid">Why this plan · what runs in parallel · which guards apply</summary>
+          <div className="pt-2">
+            <PlanRationale rationale={rationaleOf(goal)} steps={stepsFromTree(tree)} rate={rate} compact />
+          </div>
+        </details>
+      )}
       {waiting && (
         <div className="banner" aria-live="polite">
           Top-up submitted — waiting for the deposit to confirm on preprod (usually under a minute). Approve re-enables when your treasury balance updates.

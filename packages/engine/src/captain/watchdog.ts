@@ -6,14 +6,27 @@
 //   session_stalled  — a RUNNING session produced no activity for stallMs (not while it legitimately waits:
 //                      an open decision, a paid agent job in flight, or a monitor session watching the chain)
 //   goal_completed   — every session of a goal is CLOSED: the captain verifies the definition of done and
-//                      writes the final report (one event per goal)
+//                      writes the final report (one event per goal; `timeBoxed` when the work deadline cut it)
+//   work_deadline_reached — a session's work time (WORK_DEADLINE_SECONDS from RUNNING) is over. ACTIONABLE and
+//                      acted on here, deterministically: after a short grace (the silo submits its own partial
+//                      handback at the deadline) the watchdog collects a partial handback itself and the session
+//                      closes (captain Revoke) — right after the work deadline, not at the vault expiry.
 // Each signal carries an escalation count so the captain can climb a ladder (redirect → wrap up → kill).
 // Restart-proof enough: the per-session counters are soft state; after a restart a session simply gets a fresh
 // grace period, and goal_completed is de-duplicated against the events table.
 import { agentJobs, decisions, sessions as sessionsT, type DB } from "@bulkhead/db";
-import type { BulkheadEvent } from "@bulkhead/shared";
+import { TIMEBOXED_CLOSE_STATUS, isTimeLimitPartial, type BulkheadEvent, type Handback } from "@bulkhead/shared";
 import { and, eq, inArray } from "drizzle-orm";
 import type { EventBus } from "../contracts";
+
+/** The watchdog's hands for the work deadline (the SessionManager's timeBox; absent = report only). */
+export interface WorkDeadlineActions {
+  /** A session's work deadline (startedAt + WORK_DEADLINE_SECONDS) or null (not started / no limit). */
+  deadlineOf: (sessionId: string) => number | null;
+  /** Wait this long after the deadline for the silo's own partial handback before collecting one (default 5 s). */
+  graceMs?: number;
+  timeBox?: (sessionId: string, reason: string) => Promise<unknown>;
+}
 
 export interface WatchdogOptions {
   /** Consecutive failed tool calls before session_looping (default CAPTAIN_LOOP_FAILURES or 4). */
@@ -23,6 +36,8 @@ export interface WatchdogOptions {
   /** No activity for this long → session_stalled (default CAPTAIN_STALL_MS or 4 min). */
   stallMs?: number;
   now?: () => number;
+  /** Work deadline enforcement (see WorkDeadlineActions). */
+  work?: WorkDeadlineActions;
 }
 
 export interface SessionHealth {
@@ -43,7 +58,9 @@ interface Track {
 
 const SUCCESS = new Set(["payment_submitted", "payment_confirmed", "agent_hired", "agent_job_paid", "agent_job_result", "handback_submitted", "handback_accepted"]);
 /** Events that say nothing about the session's own progress. */
-const IGNORE = new Set(["llm_usage", "tainted", "captain_woken", "captain_absorbed", "captain_action", "captain_report", "session_stalled", "session_looping", "goal_completed"]);
+const IGNORE = new Set(["llm_usage", "tainted", "captain_woken", "captain_absorbed", "captain_action", "captain_report", "session_stalled", "session_looping", "goal_completed", "work_deadline_reached"]);
+/** Sessions whose work time can still run out (they have not handed back / closed yet). */
+const WORKING = ["RUNNING", "PAUSED", "QUARANTINED"] as const;
 const TERMINAL = new Set(["CLOSING", "CLOSED", "FAILED", "KILLED", "EXPIRED"]);
 const JOB_IN_FLIGHT: ("started" | "paid" | "running")[] = ["started", "paid", "running"];
 
@@ -59,6 +76,9 @@ export class CrewWatchdog {
   private readonly repeatLimit: number;
   readonly stallMs: number;
   private readonly now: () => number;
+  readonly work: WorkDeadlineActions | null;
+  private readonly workNoticed = new Set<string>();
+  private readonly timeBoxTried = new Map<string, number>();
 
   constructor(
     private readonly deps: { bus: EventBus; db: DB },
@@ -68,6 +88,52 @@ export class CrewWatchdog {
     this.repeatLimit = opts.repeatLimit ?? 3;
     this.stallMs = opts.stallMs ?? envNum("CAPTAIN_STALL_MS", 4 * 60_000);
     this.now = opts.now ?? Date.now;
+    this.work = opts.work ?? null;
+  }
+
+  /**
+   * Work-deadline pass (the wake filter calls it every second). For each session whose work time is over:
+   * emit work_deadline_reached once; after the grace, if it still has not handed back, collect a partial handback
+   * and close it (timeBox). Returns the sessions it acted on.
+   */
+  scanWork(): string[] {
+    const w = this.work;
+    if (!w) return [];
+    const { db, bus } = this.deps;
+    const now = this.now();
+    const grace = w.graceMs ?? 5_000;
+    // Only sessions still working: one that handed back (COMPLETING) is closed by its review.
+    const rows = db
+      .select()
+      .from(sessionsT)
+      .where(inArray(sessionsT.status, [...WORKING]))
+      .all();
+    const acted: string[] = [];
+    for (const r of rows) {
+      const end = r.startedAt ? w.deadlineOf(r.id) : null;
+      if (end === null || now < end) continue;
+      const secs = Math.round((end - r.startedAt!) / 1000);
+      if (!this.workNoticed.has(r.id)) {
+        this.workNoticed.add(r.id);
+        if (!bus.since(0, { sessionId: r.id }).some((x) => x.type === "work_deadline_reached")) {
+          bus.emit("work_deadline_reached", {
+            goalId: r.goalId,
+            sessionId: r.id,
+            data: { letter: r.letter, taskType: r.taskType, status: r.status, workDeadlineAt: end, workSeconds: secs, action: "partial handback collected; the session closes and its funds return to the treasury" },
+          });
+        }
+      }
+      if (!w.timeBox || now < end + grace) continue; // the silo hands back its own partial at the deadline
+      const tried = this.timeBoxTried.get(r.id);
+      if (tried !== undefined && now - tried < 10_000) continue; // in flight / retry at most every 10 s
+      this.timeBoxTried.set(r.id, now);
+      acted.push(r.id);
+      void w
+        .timeBox(r.id, `work time (${secs} s) is over`)
+        .catch((e) => bus.emit("error", { goalId: r.goalId, sessionId: r.id, data: { kind: "timebox_failed", error: e instanceof Error ? e.message : String(e) } }));
+    }
+    for (const id of [...this.timeBoxTried.keys()]) if (!rows.some((r) => r.id === id)) this.timeBoxTried.delete(id);
+    return acted;
   }
 
   /** Read-only view for the captain's state snapshot. */
@@ -178,14 +244,33 @@ export class CrewWatchdog {
     const rows = this.deps.db.select().from(sessionsT).where(eq(sessionsT.goalId, goalId)).all();
     if (!rows.length || rows.some((r) => r.status !== "CLOSED")) return false;
     this.completedGoals.add(goalId);
-    if (this.deps.bus.since(0, { goalId }).some((x) => x.type === "goal_completed")) return false;
+    const history = this.deps.bus.since(0, { goalId });
+    if (history.some((x) => x.type === "goal_completed")) return false;
+    const partialOf = (json: string | null) => {
+      try {
+        return json ? isTimeLimitPartial(JSON.parse(json) as Handback) : false;
+      } catch {
+        return false;
+      }
+    };
     const view = rows
       .sort((a, b) => a.letter.localeCompare(b.letter))
-      .map((r) => ({ sessionId: r.id, letter: r.letter, name: r.name, taskType: r.taskType, closeStatus: r.closeStatus ?? "UNKNOWN", doneMet: r.closeStatus === "COMPLETED", spentMicro: r.spentMicro, hasHandback: !!r.handbackJson }));
+      .map((r) => ({ sessionId: r.id, letter: r.letter, name: r.name, taskType: r.taskType, closeStatus: r.closeStatus ?? "UNKNOWN", doneMet: r.closeStatus === "COMPLETED", spentMicro: r.spentMicro, hasHandback: !!r.handbackJson, timeBoxed: r.closeStatus === TIMEBOXED_CLOSE_STATUS || partialOf(r.handbackJson) }));
     const met = view.filter((v) => v.doneMet).length;
+    // Time-boxed: the work deadline cut at least one session (partial handback / watchdog collected it).
+    const timeBoxed = view.some((v) => v.timeBoxed) || history.some((x) => x.type === "work_deadline_reached");
+    const timed = rows.find((r) => r.startedAt && this.work?.deadlineOf(r.id));
+    const workSeconds = timed ? Math.round((this.work!.deadlineOf(timed.id)! - timed.startedAt!) / 1000) : 0;
     this.deps.bus.emit("goal_completed", {
       goalId,
-      data: { sessions: view, doneMet: met, total: view.length, outcome: met === view.length ? "all_done" : met > 0 ? "partial" : "failed" },
+      data: {
+        sessions: view,
+        doneMet: met,
+        total: view.length,
+        outcome: met === view.length ? "all_done" : met > 0 ? "partial" : "failed",
+        ...(workSeconds ? { workSeconds } : {}),
+        ...(timeBoxed ? { timeBoxed: true, timeBoxedSessions: view.filter((v) => v.timeBoxed).map((v) => v.letter) } : {}),
+      },
     });
     return true;
   }

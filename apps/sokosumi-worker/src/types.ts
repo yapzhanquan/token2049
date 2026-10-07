@@ -166,6 +166,42 @@ export interface TaskJournal {
   /** Last error (truncated, secret-free) and when. */
   lastError?: { at: number; message: string };
   failedReason?: string;
+  /** Live progress comments on the Task (progress.ts). */
+  progress?: ProgressState;
+}
+
+/** Progress-comment state (progress.ts). Keys are recorded before a post and never posted twice. */
+export type ProgressKeyState = "queued" | "posting" | "posted" | "skipped";
+export interface ProgressItem {
+  key: string;
+  text: string;
+  /** Critical items (funding, errors, done) may use the comments reserved at the end of the budget. */
+  critical?: boolean;
+  at: number;
+}
+export interface PlannedCrewMember {
+  letter: string;
+  role: string;
+  name: string;
+  budgetTUSD: string;
+  /** Letters whose handbacks this session waits for. */
+  after: string[];
+}
+export interface ProgressState {
+  keys: Record<string, ProgressKeyState>;
+  queue: ProgressItem[];
+  /** Progress comments posted (or attempted) on this Task. */
+  count: number;
+  lastPostAt?: number;
+  /** Last engine event id consumed for this Task's goal. */
+  cursor?: number;
+  plan?: PlannedCrewMember[];
+  sessions?: Record<string, { letter?: string; role?: string }>;
+  /** Engine funding shortfall text while the crew cannot be funded. */
+  stall?: { text: string; at: number; resolvedAt?: number };
+  fundingTx?: string;
+  /** A persisting worker error (posted once in plain language after a grace period). */
+  err?: { msg: string; since: number };
 }
 
 export interface WorkerState {
