@@ -34,10 +34,32 @@
     }
   },
   "sokosumi": {
-    "cli": "installed 1.0.0 (demo verified on 1.0.4)",
-    "auth": "NOT SIGNED IN — run: sokosumi --preprod auth login",
-    "vendor": null,
-    "coworker": null
+    "target": "preprod",
+    "signedInAs": "zhanquan21@gmail.com (API-key login, key kept in bulkhead/.env)",
+    "organization": {
+      "id": "01a1146d-87ef-77d5-8020-bc21a58620dc",
+      "slug": "bulkhead-3qb9jz",
+      "name": "Bulkhead",
+      "workspaceId": "01a1146d-880d-70f2-9581-597b39d8fd85"
+    },
+    "vendor": {
+      "id": "01a11473-da9b-738a-a64a-78d2fbb8ca43",
+      "name": "Bulkhead",
+      "slug": "bulkhead"
+    },
+    "coworker": {
+      "id": "01a11474-5240-74ee-acc6-89cdaa039e95",
+      "name": "Bulkhead Captain",
+      "slug": "bulkhead-captain",
+      "capabilities": [
+        "tasks"
+      ],
+      "isWhitelisted": false,
+      "workspaceAccess": "GRANTED"
+    },
+    "runtimeKey": "VERIFIED stored in CLI OS vault via coworkers api-key | runtime key-import --api-key-stdin (never printed)",
+    "cliVersion": "1.0.0 (no --personal; uses --workspace-id / --organization-id)",
+    "at": "2026-10-07T03:42:34.929Z"
   },
   "masumiRegistration": {
     "state": "RegistrationConfirmed (VERIFIED via MPS GET /registry + Blockfrost)",
