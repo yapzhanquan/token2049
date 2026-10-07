@@ -1,0 +1,40 @@
+{
+  "name": "@bulkhead/engine",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "dev": "tsx watch --env-file-if-exists=../../.env src/server.ts",
+    "start": "tsx --env-file-if-exists=../../.env src/server.ts",
+    "setup:chain": "tsx --env-file-if-exists=../../.env scripts/setup-chain.ts",
+    "recover": "tsx --env-file-if-exists=../../.env scripts/recover.ts",
+    "e2e:preprod": "tsx --env-file-if-exists=../../.env scripts/e2e-preprod.ts",
+    "verify:chain": "tsx --env-file-if-exists=../../.env scripts/verify-chain.ts",
+    "demo:attack-onchain": "tsx --env-file-if-exists=../../.env scripts/demo-attack-onchain.ts",
+    "vault:onchain": "tsx --env-file-if-exists=../../.env scripts/vault-onchain.ts",
+    "typecheck": "tsc -p .",
+    "test": "vitest run --passWithNoTests"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "0.131.0",
+    "@bulkhead/chain": "workspace:*",
+    "@bulkhead/db": "workspace:*",
+    "@bulkhead/shared": "workspace:*",
+    "@hono/node-server": "2.1.3",
+    "drizzle-orm": "0.45.3",
+    "hono": "4.13.13",
+    "openai": "7.28.0",
+    "zod": "4.6.5"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "tsx": "4.23.15",
+    "typescript": "^5.9.3",
+    "vitest": "5.0.3"
+  }
+}

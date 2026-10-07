@@ -1,0 +1,5 @@
+{ "name": "@bulkhead/chain", "version": "0.1.0", "private": true, "type": "module",
+  "main": "./src/index.ts", "types": "./src/index.ts", "exports": { ".": "./src/index.ts" },
+  "scripts": { "typecheck": "tsc -p .", "test": "vitest run --passWithNoTests" },
+  "dependencies": { "@bulkhead/shared": "workspace:*", "@bulkhead/db": "workspace:*", "@meshsdk/core": "1.9.1", "@meshsdk/core-cst": "1.9.1" },
+  "devDependencies": { "@types/node": "^24.0.0", "typescript": "^5.9.3", "vitest": "5.0.3", "tsx": "4.23.15" } }

@@ -1,0 +1,29 @@
+{
+  "name": "bulkhead",
+  "private": true,
+  "description": "Parallel, isolated AI agent sessions with Cardano wallets (preprod, end-to-end).",
+  "packageManager": "pnpm@10.34.6",
+  "engines": {
+    "node": ">=20.19.0"
+  },
+  "scripts": {
+    "dev": "concurrently -n engine,web,market -c blue,magenta,green \"pnpm --filter @bulkhead/engine dev\" \"pnpm --filter @bulkhead/web dev\" \"pnpm --filter @bulkhead/mock-market dev\"",
+    "setup:chain": "pnpm --filter @bulkhead/engine setup:chain",
+    "recover": "pnpm --filter @bulkhead/engine recover",
+    "e2e:preprod": "pnpm --filter @bulkhead/engine e2e:preprod",
+    "demo:attack-onchain": "pnpm --filter @bulkhead/engine demo:attack-onchain",
+    "verify:chain": "pnpm --filter @bulkhead/engine verify:chain",
+    "stripe:listen": "stripe listen --forward-to localhost:3000/api/stripe/webhook",
+    "db:push": "pnpm --filter @bulkhead/db push",
+    "test": "pnpm -r --if-present test",
+    "typecheck": "pnpm -r --if-present typecheck",
+    "gen:env": "tsx scripts/gen-env.ts",
+    "vault:self-custody": "pnpm --filter @bulkhead/engine exec tsx --env-file-if-exists=../../.env scripts/vault-self-custody-onchain.ts",
+    "verify:tusd": "pnpm --filter @bulkhead/engine exec tsx --env-file-if-exists=../../.env scripts/verify-tusd-cip68.ts"
+  },
+  "devDependencies": {
+    "concurrently": "10.0.5",
+    "typescript": "^5.9.3",
+    "tsx": "4.23.15"
+  }
+}

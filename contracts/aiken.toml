@@ -1,0 +1,23 @@
+name = "bulkhead/session-vault"
+version = "0.0.0"
+compiler = "v1.1.24"
+plutus = "v3"
+license = "Apache-2.0"
+description = "Bulkhead Session Vault (per-session spending vault, Plutus V3)"
+
+[repository]
+user = "bulkhead"
+project = "session-vault"
+platform = "github"
+
+[[dependencies]]
+name = "aiken-lang/stdlib"
+version = "v3.0.0"
+source = "github"
+
+[[dependencies]]
+name = "aiken-lang/fuzz"
+version = "v2.1.1"
+source = "github"
+
+[config]

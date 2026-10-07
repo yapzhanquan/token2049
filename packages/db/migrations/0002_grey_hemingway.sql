@@ -1,0 +1,1 @@
+ALTER TABLE `sessions` ADD `script_hash` text;

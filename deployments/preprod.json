@@ -1,0 +1,440 @@
+{
+  "network": "preprod",
+  "explorer": "https://preprod.cardanoscan.io",
+  "contract": {
+    "name": "Bulkhead Session Vault",
+    "validator": "session_vault.session_vault.spend",
+    "source": "contracts/validators/session_vault.ak",
+    "blueprint": "contracts/plutus.json",
+    "version": "1.0.0",
+    "aikenVersion": "v1.1.24+bacbeb3",
+    "plutusVersion": "v3",
+    "stdlib": "aiken-lang/stdlib v3.0.0",
+    "unappliedHash": "edd870abd45786e6352dba8ed4ae5cd0cf1f8952574c889ffad7726a",
+    "unappliedScriptSizeBytes": 1822,
+    "parameters": [
+      {
+        "title": "owner",
+        "schema": {
+          "$ref": "#/definitions/cardano~1address~1Address"
+        }
+      },
+      {
+        "title": "captain_vkh",
+        "schema": {
+          "$ref": "#/definitions/aiken~1crypto~1VerificationKeyHash"
+        }
+      },
+      {
+        "title": "session_vkh",
+        "schema": {
+          "$ref": "#/definitions/aiken~1crypto~1VerificationKeyHash"
+        }
+      },
+      {
+        "title": "expiry",
+        "schema": {
+          "$ref": "#/definitions/Int"
+        }
+      },
+      {
+        "title": "payees",
+        "schema": {
+          "$ref": "#/definitions/List<cardano~1address~1Credential>"
+        }
+      },
+      {
+        "title": "per_tx_max_tusd",
+        "schema": {
+          "$ref": "#/definitions/Int"
+        }
+      },
+      {
+        "title": "ada_allowance",
+        "schema": {
+          "$ref": "#/definitions/Int"
+        }
+      },
+      {
+        "title": "tusd_policy",
+        "schema": {
+          "$ref": "#/definitions/cardano~1assets~1PolicyId"
+        }
+      },
+      {
+        "title": "tusd_name",
+        "schema": {
+          "$ref": "#/definitions/cardano~1assets~1AssetName"
+        }
+      }
+    ],
+    "redeemer": {
+      "title": "redeemer",
+      "schema": {
+        "$ref": "#/definitions/session_vault~1VaultAction"
+      }
+    },
+    "datum": {
+      "title": "_datum",
+      "schema": {
+        "$ref": "#/definitions/Data"
+      }
+    },
+    "definitions": {
+      "Data": {
+        "title": "Data",
+        "description": "Any Plutus data."
+      },
+      "Int": {
+        "dataType": "integer"
+      },
+      "List<cardano/address/Credential>": {
+        "dataType": "list",
+        "items": {
+          "$ref": "#/definitions/cardano~1address~1Credential"
+        }
+      },
+      "Option<cardano/address/StakeCredential>": {
+        "title": "Option",
+        "anyOf": [
+          {
+            "title": "Some",
+            "description": "An optional value.",
+            "dataType": "constructor",
+            "index": 0,
+            "fields": [
+              {
+                "$ref": "#/definitions/cardano~1address~1StakeCredential"
+              }
+            ]
+          },
+          {
+            "title": "None",
+            "description": "Nothing.",
+            "dataType": "constructor",
+            "index": 1,
+            "fields": []
+          }
+        ]
+      },
+      "aiken/crypto/ScriptHash": {
+        "title": "ScriptHash",
+        "dataType": "bytes"
+      },
+      "aiken/crypto/VerificationKeyHash": {
+        "title": "VerificationKeyHash",
+        "dataType": "bytes"
+      },
+      "cardano/address/Address": {
+        "title": "Address",
+        "description": "A Cardano `Address` typically holding one or two credential references.\n\n Note that legacy bootstrap addresses (a.k.a. 'Byron addresses') are\n completely excluded from Plutus contexts. Thus, from an on-chain\n perspective only exists addresses of type 00, 01, ..., 07 as detailed\n in [CIP-0019 :: Shelley Addresses](https://github.com/cardano-foundation/CIPs/tree/master/CIP-0019/#shelley-addresses).",
+        "anyOf": [
+          {
+            "title": "Address",
+            "dataType": "constructor",
+            "index": 0,
+            "fields": [
+              {
+                "title": "payment_credential",
+                "$ref": "#/definitions/cardano~1address~1PaymentCredential"
+              },
+              {
+                "title": "stake_credential",
+                "$ref": "#/definitions/Option<cardano~1address~1StakeCredential>"
+              }
+            ]
+          }
+        ]
+      },
+      "cardano/address/Credential": {
+        "title": "Credential",
+        "description": "A general structure for representing an on-chain `Credential`.\n\n Credentials are always one of two kinds: a direct public/private key\n pair, or a script (native or Plutus).",
+        "anyOf": [
+          {
+            "title": "VerificationKey",
+            "dataType": "constructor",
+            "index": 0,
+            "fields": [
+              {
+                "$ref": "#/definitions/aiken~1crypto~1VerificationKeyHash"
+              }
+            ]
+          },
+          {
+            "title": "Script",
+            "dataType": "constructor",
+            "index": 1,
+            "fields": [
+              {
+                "$ref": "#/definitions/aiken~1crypto~1ScriptHash"
+              }
+            ]
+          }
+        ]
+      },
+      "cardano/address/PaymentCredential": {
+        "title": "PaymentCredential",
+        "description": "A general structure for representing an on-chain `Credential`.\n\n Credentials are always one of two kinds: a direct public/private key\n pair, or a script (native or Plutus).",
+        "anyOf": [
+          {
+            "title": "VerificationKey",
+            "dataType": "constructor",
+            "index": 0,
+            "fields": [
+              {
+                "$ref": "#/definitions/aiken~1crypto~1VerificationKeyHash"
+              }
+            ]
+          },
+          {
+            "title": "Script",
+            "dataType": "constructor",
+            "index": 1,
+            "fields": [
+              {
+                "$ref": "#/definitions/aiken~1crypto~1ScriptHash"
+              }
+            ]
+          }
+        ]
+      },
+      "cardano/address/StakeCredential": {
+        "title": "StakeCredential",
+        "description": "Represent a type of object that can be represented either inline (by hash)\n or via a reference (i.e. a pointer to an on-chain location).\n\n This is mainly use for capturing pointers to a stake credential\n registration certificate in the case of so-called pointer addresses.",
+        "anyOf": [
+          {
+            "title": "Inline",
+            "dataType": "constructor",
+            "index": 0,
+            "fields": [
+              {
+                "$ref": "#/definitions/cardano~1address~1Credential"
+              }
+            ]
+          },
+          {
+            "title": "Pointer",
+            "dataType": "constructor",
+            "index": 1,
+            "fields": [
+              {
+                "title": "slot_number",
+                "$ref": "#/definitions/Int"
+              },
+              {
+                "title": "transaction_index",
+                "$ref": "#/definitions/Int"
+              },
+              {
+                "title": "certificate_index",
+                "$ref": "#/definitions/Int"
+              }
+            ]
+          }
+        ]
+      },
+      "cardano/assets/AssetName": {
+        "title": "AssetName",
+        "dataType": "bytes"
+      },
+      "cardano/assets/PolicyId": {
+        "title": "PolicyId",
+        "dataType": "bytes"
+      },
+      "session_vault/VaultAction": {
+        "title": "VaultAction",
+        "description": "The only accepted redeemers: Constr 0 [] / Constr 1 [] / Constr 2 [].",
+        "anyOf": [
+          {
+            "title": "Pay",
+            "description": "Session key pays an allowed payee, within the per-tx limits, before expiry.",
+            "dataType": "constructor",
+            "index": 0,
+            "fields": []
+          },
+          {
+            "title": "Revoke",
+            "description": "Captain sweeps everything to the owner, any time.",
+            "dataType": "constructor",
+            "index": 1,
+            "fields": []
+          },
+          {
+            "title": "Recover",
+            "description": "Anyone sweeps everything to the owner, strictly after expiry.",
+            "dataType": "constructor",
+            "index": 2,
+            "fields": []
+          }
+        ]
+      }
+    }
+  },
+  "vaultIntegrationRun": {
+    "startedAt": "2026-10-06T17:48:54.511Z",
+    "finishedAt": "2026-10-06T17:55:26.677Z",
+    "testOwnerTreasury": {
+      "account": 990002,
+      "address": "addr_test1qq7n5dtady4vhcx2mkzdd965yup7mu6thj62m0gmp4n9ydy9w8trsr3x7mt0ffgfjgjf5k9c5ldr6geke5umn7uq8p7sur7we9",
+      "stakeKeyHash": "8571d6380e26f6d6f4a50992249a58b8a7da3d2336cd39b9fb80387d"
+    },
+    "captainCollateral": {
+      "address": "addr_test1qqy805z2u6hc29hh4wyx8mkf03j725pdt2v6xrpnue08hzq37vyd6fr78nt73y7caz0p3z7j9nmzq7l2z9ar3znh3z7qnryqft",
+      "utxo": "0eec8e123cf77293094ca01eb69c7641ec94c2378aa819cf457c3ef6a9030ae8#0"
+    },
+    "sessions": [
+      {
+        "vault": "A",
+        "sessionId": "vault-test-A-1791308934991",
+        "appliedScriptHash": "d6637b97e35fd8098461e5e34bd37772bc7d76f921ace952ce1bfe3b",
+        "vaultAddress": "addr_test1zrtxx7uhud0aszvyv8j7xj7nwaetcltklys6e62jecdluwu9w8trsr3x7mt0ffgfjgjf5k9c5ldr6geke5umn7uq8p7sca82pc",
+        "scriptSizeBytes": 2092,
+        "expiry": "2026-10-06T19:48:54.991Z",
+        "payees": [
+          "addr_test1qra72xznumc3fg4qsr8mmdyrzrdw45nh790h2s36pladqn9f65nslquzy5fq66337vv94ef9ayra0h2y2annmjtexresm3787g"
+        ],
+        "perTxMaxTusdMicro": "5000000",
+        "adaAllowanceLovelace": "3000000",
+        "txs": {
+          "fund": "1fdf040b7f4ffdba1911d0a00496f5841a6198ca592047d0509078dd9bed7bdd",
+          "pay": "2f862d7c0c016557628247abdc5e120eb5adf1fa2ed408fae5efad4ab3a842d0",
+          "revoke": "e5f62522d3ef11fc9c107ec682877052e8332cc11c12126eff69af2f46ad28c0"
+        },
+        "exUnits": {
+          "pay": [
+            {
+              "mem": 266816,
+              "steps": 91053296
+            }
+          ],
+          "revoke": [
+            {
+              "mem": 58066,
+              "steps": 20275359
+            }
+          ]
+        },
+        "fees": {
+          "pay": "306711",
+          "revoke": "287364"
+        },
+        "rejected": {
+          "A: Pay over the per-tx limit (6 tUSD > 5)": "Session Vault script rejected the Pay tx at evaluation: evaluateTx failed: {\"ScriptFailures\":{}} · ogmios v6: {\"code\":3010,\"message\":\"Some scripts of the transactions terminated with error(s).\",\"data\":[{\"validator\":{\"index\":0,\"purpose\":\"spend\"},\"error\":{\"code\":3012,\"message\":\"Some of the scripts failed to evaluate to a positive outcome. The field 'data.validationError' informs about the nature of the error, and 'data.traces' lists all the execution traces collected during the script execution.\",\"data\":{\"validationError\":\"An error has occurred:\\nThe machine terminated because of an error, eithe",
+          "A: Pay to the attacker address": "Session Vault script rejected the Pay tx at evaluation: evaluateTx failed: {\"ScriptFailures\":{}} · ogmios v6: {\"code\":3010,\"message\":\"Some scripts of the transactions terminated with error(s).\",\"data\":[{\"validator\":{\"index\":0,\"purpose\":\"spend\"},\"error\":{\"code\":3012,\"message\":\"Some of the scripts failed to evaluate to a positive outcome. The field 'data.validationError' informs about the nature of the error, and 'data.traces' lists all the execution traces collected during the script execution.\",\"data\":{\"validationError\":\"An error has occurred:\\nThe machine terminated because of an error, eithe"
+        }
+      },
+      {
+        "vault": "B",
+        "sessionId": "vault-test-B-1791308935018",
+        "appliedScriptHash": "24f2eb19f45e9174ba20b5fee43028ee19fe233a8ca77530d589207c",
+        "vaultAddress": "addr_test1zqj096ce730fza96yz6laeps9rhpnl3r82x2wafs6kyjqly9w8trsr3x7mt0ffgfjgjf5k9c5ldr6geke5umn7uq8p7sz5uugy",
+        "scriptSizeBytes": 2092,
+        "expiry": "2026-10-06T17:53:55.018Z",
+        "txs": {
+          "fund": "1fdf040b7f4ffdba1911d0a00496f5841a6198ca592047d0509078dd9bed7bdd",
+          "recover": "5393aeb8c742ea583ad808ddcc2a08d1f07614dfbb27a22b2bf9f49d1c2cd6ed",
+          "randomKeyCollateral": "3c60af568e4b29f0947c9ece2643e70ff68b5f43d4805f32e91bc85c9c7ad09d",
+          "randomKeySweepBack": "6653ee0b18080518624e682dca84160988691e3c81e5dfab37b333ab079db569"
+        },
+        "exUnits": {
+          "recover": [
+            {
+              "mem": 59757,
+              "steps": 21396440
+            }
+          ]
+        },
+        "fees": {
+          "recover": "278628"
+        }
+      }
+    ]
+  },
+  "updatedAt": "2026-10-06T19:05:57.119Z",
+  "attackDemo": {
+    "at": "2026-10-06T17:26:37.686Z",
+    "sessionId": "vault-test-attack-1791307551234",
+    "appliedScriptHash": "298aaf6a9f47267fbdbb569d8976db37bf58f1bcdb47232d72d56364",
+    "vaultAddress": "addr_test1zq5c4tm2narjvlaahdtfmztkmvmm7k83hnd5wgedwt2kxey9w8trsr3x7mt0ffgfjgjf5k9c5ldr6geke5umn7uq8p7sp7943z",
+    "attacker": "addr_test1vq9mt2fmnradv0khu50s2ckwcw3ptjcfsspf5u9zkaealjgwdxprz",
+    "allowedPayees": [
+      "addr_test1qra72xznumc3fg4qsr8mmdyrzrdw45nh790h2s36pladqn9f65nslquzy5fq66337vv94ef9ayra0h2y2annmjtexresm3787g"
+    ],
+    "maliciousTxHash": "40053d2a3a6d9c13eb4de6ce0c999606c642d6fdaeee3fd3b86c432b53bb5353",
+    "evaluationError": "evaluateTx failed: {\"ScriptFailures\":{}} · ogmios v6: {\"code\":3010,\"message\":\"Some scripts of the transactions terminated with error(s).\",\"data\":[{\"validator\":{\"index\":0,\"purpose\":\"spend\"},\"error\":{\"code\":3012,\"message\":\"Some of the scripts failed to evaluate to a positive outcome. The field 'data.validationError' informs about the nature of the error, and 'data.traces' lists all the execution traces collected during the script execution.\",\"data\":{\"validationError\":\"An error has occurred:\\nThe machine terminated because of an error, either from a built-in function or from an explicit use of 'error'.\\nCaused by: (error)\",\"traces\":[]}}}]}",
+    "submissionError": "HTTP 400 from https://cardano-preprod.blockfrost.io/api/v0/tx/submit: {\"error\":\"Bad Request\",\"message\":\"{\\\"contents\\\":{\\\"contents\\\":{\\\"contents\\\":{\\\"era\\\":\\\"ShelleyBasedEraConway\\\",\\\"error\\\":[\\\"ConwayUtxowFailure (UtxoFailure (UtxosFailure (ValidationTagMismatch Phase2Valid (FailedUnexpectedly (PlutusFailure \\\\\\\"\\\\\\\\nThe PlutusV3 script failed:\\\\\\\\nBase64-encoded script bytes:\\\\\\\\n\\\\\\\\\\\\\\\"WQgpAQEAMzMzMzIiIiIiKYAKuiq6GroKq5+queqrnauam64AmbrgCJutAHm6wAabrQBZutAEm64AObrgAkiIiIiIiIiJZgAmRlMAEwEAAZgIGAiADNw6QAUwEAAkiIlmACYARgIG6oAOJkZkUwARMjMiMpgAmA2ADN1hgNmA4ADMjMAEAE",
+    "maliciousTxOnChain": false,
+    "txs": {
+      "fund": "2739617fd7e288b94cfca858d5fa93ac3919d0484f533fe337c177ca391f983d",
+      "revoke": "8f7ef1aec63f76f7f24e0402903292c922685a334cafd2125fd855860530a0f7",
+      "collateral": "0eec8e123cf77293094ca01eb69c7641ec94c2378aa819cf457c3ef6a9030ae8#0"
+    }
+  },
+  "selfCustodyVaultRun": {
+    "startedAt": "2026-10-06T19:03:02.466Z",
+    "fund": {
+      "txHash": "f8b090224f2bfcbb2d63d71f37190d24b29066390fd22a71267360a3229085ba",
+      "feeLovelace": "176589",
+      "vaultLovelace": "4219730"
+    },
+    "pay": {
+      "txHash": "650ee8371a9a650ec25107fb84484a1c4dcc5a577f10964f984104a0c0c74274",
+      "feeLovelace": "307503",
+      "exUnits": [
+        {
+          "mem": 294497,
+          "steps": 100258625
+        }
+      ]
+    },
+    "revoke": {
+      "txHash": "16e9fe8c833a2d460a84e86702b06c3165a1b022042bb63a82c8a93200b1c05a",
+      "feeLovelace": "288112"
+    },
+    "wallet": "addr_test1qzpmrds2cr3rs09j5sm32dp25x7w4ex9dvmkz5d3p5ledda4navw0f00pgp7exxq2rh2z4fpvdqfg0x5kz52xc2e5htqs67mgz",
+    "vault": {
+      "address": "addr_test1zq3ksf0n9lf0mjkltm5yt9qru3ahknvywyd2j2k67ejw9na4navw0f00pgp7exxq2rh2z4fpvdqfg0x5kz52xc2e5htq5q8l02",
+      "scriptHash": "236825f32fd2fdcadf5ee8459403e47b7b4d84711aa92adaf664e2cf"
+    },
+    "collateral": "0eec8e123cf77293094ca01eb69c7641ec94c2378aa819cf457c3ef6a9030ae8#0",
+    "returnLeftovers": "9d383bd44471517e1b70cd8f2cbeea34d912e3bf7980b7a774859bc1aca50690",
+    "finishedAt": "2026-10-06T19:05:57.116Z",
+    "steps": [
+      {
+        "name": "operator → throwaway wallet (12 tADA + 2 tUSD)",
+        "ok": true,
+        "detail": "wallet addr_test1qzpmrds2cr3rs09j5sm32dp25x7w4ex9dvmkz5d3p5ledda4navw0f00pgp7exxq2rh2z4fpvdqfg0x5kz52xc2e5htqs67mgz",
+        "txHash": "d9d302df530b69d11a7bed63e0fab7215340c3483156812ddfa417e649d9c133"
+      },
+      {
+        "name": "vault owner = wallet full address",
+        "ok": true,
+        "detail": "vault addr_test1zq3ksf0n9lf0mjkltm5yt9qru3ahknvywyd2j2k67ejw9na4navw0f00pgp7exxq2rh2z4fpvdqfg0x5kz52xc2e5htq5q8l02 (script 236825f32fd2fdcadf5ee8459403e47b7b4d84711aa92adaf664e2cf, stake = wallet stake key)"
+      },
+      {
+        "name": "unsigned vault funding signed by the wallet (witness set) + submitSigned",
+        "ok": true,
+        "detail": "inputs from the wallet only, inline datum Void, 2 tUSD + 4.219730 tADA",
+        "txHash": "f8b090224f2bfcbb2d63d71f37190d24b29066390fd22a71267360a3229085ba"
+      },
+      {
+        "name": "Pay 0.5 tUSD to the allowed payee (session key)",
+        "ok": true,
+        "detail": "fee 0.307503 tADA, exUnits mem 294497 steps 100258625",
+        "txHash": "650ee8371a9a650ec25107fb84484a1c4dcc5a577f10964f984104a0c0c74274"
+      },
+      {
+        "name": "Revoke (captain) → everything back to the WALLET",
+        "ok": true,
+        "detail": "1 output → wallet, 1.5 tUSD + 2.451795 tADA",
+        "txHash": "16e9fe8c833a2d460a84e86702b06c3165a1b022042bb63a82c8a93200b1c05a"
+      },
+      {
+        "name": "leftovers → operator",
+        "ok": true,
+        "detail": "throwaway wallet swept back to the operator",
+        "txHash": "9d383bd44471517e1b70cd8f2cbeea34d912e3bf7980b7a774859bc1aca50690"
+      }
+    ]
+  }
+}

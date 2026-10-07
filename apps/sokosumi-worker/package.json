@@ -1,0 +1,5 @@
+{ "name": "@bulkhead/sokosumi-worker", "version": "0.1.0", "private": true, "type": "module",
+  "description": "Continuous Sokosumi Coworker worker: turns Sokosumi Tasks into Bulkhead goals (preprod).",
+  "scripts": { "start": "tsx --env-file-if-exists=../../.env --env-file-if-exists=.env src/main.ts", "once": "tsx --env-file-if-exists=../../.env --env-file-if-exists=.env src/main.ts --once", "typecheck": "tsc -p .", "test": "vitest run" },
+  "dependencies": { "@bulkhead/shared": "workspace:*" },
+  "devDependencies": { "@types/node": "^24.0.0", "typescript": "^5.9.3", "tsx": "4.23.15", "vitest": "5.0.3" } }
