@@ -155,7 +155,8 @@ export const HandbackSchema = z.object({
   result: z.string().max(8_000),
   summary: z.string().min(1).max(280),
   sources: z.array(z.string().max(500)).max(20).default([]),
-  flags: z.array(z.string().max(80)).max(10).default([]),
+  // Long flags are clipped, not rejected: a too-wordy flag must not fail an otherwise valid handback.
+  flags: z.array(z.string().transform((f) => (f.length > 80 ? `${f.slice(0, 79)}…` : f))).max(10).default([]),
   /** buy_pay: tx hashes of the payments made. */
   txHashes: z.array(z.string().regex(/^[0-9a-f]{64}$/)).max(50).optional(),
   /** hire_agent: the job id and result hash returned by the paid agent. */

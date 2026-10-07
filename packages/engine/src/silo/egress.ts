@@ -101,7 +101,15 @@ export async function egressFetch(rawUrl: string, o: EgressOptions): Promise<Egr
     if (url.username || url.password) return { kind: "blocked", reason: "credentials in URL not allowed", suspicious: true };
     if (!hostInScope(url.hostname, o.dataScope)) return { kind: "blocked", reason: `${url.hostname} is not in the session's dataScope`, suspicious: true };
     const hostProblem = await checkHost(url, o);
-    if (hostProblem) return { kind: "blocked", reason: hostProblem, suspicious: true };
+    // Still blocked either way. Only a private target the agent named itself (an IP literal or
+    // localhost) is suspicious enough to quarantine; a public hostname that the local network's DNS
+    // resolves privately (DNS filters, captive portals) or fails to resolve is an environment
+    // problem, so the agent just gets an error and moves on.
+    if (hostProblem) {
+      const host = url.hostname.replace(/^\[|\]$/g, "");
+      const named = isIP(host) !== 0 || host === "localhost" || host.endsWith(".localhost") || host.endsWith(".local") || host.endsWith(".internal");
+      return { kind: "blocked", reason: hostProblem, suspicious: named };
+    }
     let res: Response;
     try {
       res = await f(url, { redirect: "manual", signal: AbortSignal.timeout(o.timeoutMs), headers: { "user-agent": "bulkhead-egress/0.1", accept: "text/html,text/plain,application/json;q=0.9,*/*;q=0.5" } });
